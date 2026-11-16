@@ -1,22 +1,47 @@
-//! Library API for TCP reachability probes.
+//! TCP connection probes with explicit outcomes, deadlines, and cancellation.
 //!
-//! The crate exposes a side-effect-free probing core. The `tcping` binary
-//! builds CLI parsing, signal handling, and output formatting on top of this
-//! API.
-#![deny(unreachable_pub)]
-
+//! The async engine owns no runtime and performs no terminal I/O. Network
+//! adapters can be replaced for deterministic tests or application integration.
+//!
+//! ```no_run
+//! use std::{convert::Infallible, ops::ControlFlow, time::Duration};
+//! use tcping::{Engine, Event, SessionConfig};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = SessionConfig::new("example.com:443".parse()?)
+//!     .with_count(4)?
+//!     .with_connect_timeout(Duration::from_secs(2))?;
+//! let engine = Engine::default();
+//! let session = engine.collect(&config).await?;
+//! assert_eq!(session.probes().len(), 4);
+//!
+//! let continuous = config.continuous();
+//! engine.run_until(&continuous, tokio::time::sleep(Duration::from_secs(10)), |event| {
+//!     if let Event::Probe(probe) = event {
+//!         let _outcome = probe.outcome();
+//!     }
+//!     Ok::<_, Infallible>(ControlFlow::Continue(()))
+//! }).await?;
+//! # Ok(())
+//! # }
+//! ```
+mod config;
+mod engine;
 mod error;
-mod probe;
-mod session;
+mod model;
+mod network;
 mod stats;
 mod target;
-mod timestamp;
 
-pub use error::{Result, TcpingError};
-pub use session::{
-    PingEvent, PingOptions, PingSession, ProbeCount, run_collect, run_collect_async,
-    run_with_handler, run_with_handler_async, run_with_handler_until,
+#[cfg(feature = "report")]
+pub mod report;
+
+pub use config::{AddressFamily, ProbeCount, SessionConfig};
+pub use engine::Engine;
+pub use error::{ConfigError, RunError, SessionError};
+pub use model::{
+    Counts, Event, Failure, FailureKind, LatencyStats, Outcome, Probe, Resolution,
+    ResolutionSource, Session, StopReason, Summary,
 };
-pub use stats::{OUTPUT_SCHEMA_V1, OUTPUT_SCHEMA_V2, PingResult, Summary, output_schema};
-pub use target::{ResolvedTarget, Target, resolve_target};
-pub use timestamp::RecordTimestamp;
+pub use network::{Connector, DnsResolver, Lookup, Resolver, TcpConnector};
+pub use target::Target;

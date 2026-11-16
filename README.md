@@ -1,170 +1,175 @@
-<!-- ─── Language Switch & ToC (top-right) ─────────────────────────── -->
-<div align="right">
+# tcping-rs
 
-<span style="color:#999;">🇺🇸 English</span> ·
-<a href="README.zh-CN.md">🇨🇳 中文</a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Table of Contents ↗️
+TCP connection probes for Linux, macOS, and Windows. Measure connection latency without ICMP, distinguish closed ports from timeouts, and consume results as a CLI or an async Rust library.
 
-</div>
+[![Crates.io](https://img.shields.io/crates/v/tcping.svg)](https://crates.io/crates/tcping)
+[![CI](https://github.com/oksyd/tcping-rs/actions/workflows/ci.yaml/badge.svg)](https://github.com/oksyd/tcping-rs/actions/workflows/ci.yaml)
 
-<h1 align="center"><code>tcping-rs</code></h1>
+## Installation
 
-<p align=center>🛠️ tcping-rs: Rust (rs) TCP Ping (tcping) Utility for Port Reachability.</p>
+Download a binary from [GitHub Releases](https://github.com/oksyd/tcping-rs/releases), or build the checkout with Rust 1.100 or later:
 
-<div align="center">
-
-[![Crates.io](https://img.shields.io/crates/v/tcping.svg)](https://crates.io/crates/tcping)&nbsp;
-[![Repo Size](https://img.shields.io/github/repo-size/lvillis/tcping-rs?color=328657)](https://github.com/lvillis/tcping-rs)&nbsp;
-[![CI](https://github.com/lvillis/tcping-rs/actions/workflows/ci.yaml/badge.svg)](https://github.com/lvillis/tcping-rs/actions)&nbsp;
-[![Docker Pulls](https://img.shields.io/docker/pulls/lvillis/tcping?style=flat-square)](https://hub.docker.com/r/lvillis/tcping)&nbsp;
-[![Image Size](https://img.shields.io/docker/image-size/lvillis/tcping/latest?style=flat-square)](https://hub.docker.com/r/lvillis/tcping)&nbsp;
-[![Say Thanks](https://img.shields.io/badge/Say%20Thanks-!-1EAEDB.svg)](mailto:lvillis@outlook.com?subject=Thanks%20for%20tcping-rs!)
-
-</div>
-
----
-
-## ✨ Features
-
-| Feature                      | Description                                                               |
-|------------------------------|---------------------------------------------------------------------------|
-| **Pure Rust**                | Single binary with no external runtime dependencies                       |
-| **ICMP-free**                | Works where traditional `ping` is blocked; relies solely on TCP handshake |
-| **Cross-platform**           | Linux, macOS, Windows, *BSD, and any Tier-1 Rust target                   |
-| **Continuous / Burst modes** | `-t` for continuous, `-c` for specific count, plus `-e` early exit        |
-| **Machine-readable output**  | JSON (NDJSON) / CSV / Markdown via `-o`, ideal for scripts & monitoring   |
-| **Library API**              | Structured Rust API for embedding probes without parsing stdout           |
-| **Jitter stats**             | `-j` prints per-probe jitter and a p95 summary                            |
-| **Docker image**             | Multi-arch (`amd64` / `arm64`) for pipelines or Kubernetes Jobs           |
-
-
-## Usage
-
-```bash
-tcping <host:port> [-c count] [-t] [-e] [-j] [-o mode] [--timestamp[=format] | -D] [--timeout-ms ms]
+```sh
+cargo install --path . --locked
 ```
 
-Where:
+The container image is published to GHCR for `linux/amd64` and `linux/arm64`:
 
-- `host:port` is the host and port to ping
-- `-c count` specifies the number of times to ping the host (default: 4)
-- `-t` enables continuous pinging
-- `-e` exits immediately after a successful probe
-- `-j` enables jitter output (per-probe + p95 in summary)
-- `-o mode` sets the output mode (`normal`, `json`, `csv`, `md`, `color`)
-- `--timestamp[=format]` emits timestamps with every probe and summary record; defaults to `iso8601`, and `--date` is an alias
-- `-D` is shorthand for `--timestamp unix`
-- `--timeout-ms` sets per-probe timeout in milliseconds (default: 2000)
-- `-h` displays help
-- `-V` displays version
-
-## Example
-
-```bash
-$ tcping github.com:443
-
-Resolved github.com -> 140.82.113.4  (DNS system default)  in 0.9340 ms
-
-Probing 140.82.113.4:443/tcp - open - 12.7510 ms
-Probing 140.82.113.4:443/tcp - open - 12.4270 ms
-Probing 140.82.113.4:443/tcp - open - 11.4410 ms
-Probing 140.82.113.4:443/tcp - open - 12.7510 ms
-
---- 140.82.113.4:443 tcping statistics ---
-4 probes sent, 4 successful, 0.00% packet loss
-Round-trip min/avg/max = 11.4410/12.3425/12.7510 ms
+```sh
+docker run --rm ghcr.io/oksyd/tcping:latest example.com:443 -c 4
 ```
 
-```bash
-$ tcping github.com:443 --timestamp -c 2
+## CLI
 
-Resolved github.com -> 140.82.113.4  (DNS system default)  in 0.9340 ms
-
-[2026-04-08T01:15:57.952Z] Probing 140.82.113.4:443/tcp - open - 12.7510 ms
-[2026-04-08T01:15:58.954Z] Probing 140.82.113.4:443/tcp - open - 12.4270 ms
-
-[2026-04-08T01:15:58.954Z] --- 140.82.113.4:443 tcping statistics ---
-2 probes sent, 2 successful, 0.00% packet loss
-Round-trip min/avg/max = 12.4270/12.5890/12.7510 ms
+```sh
+tcping example.com:443
+tcping 127.0.0.1:8080 -c 10 --interval-ms 500
+tcping '[::1]:443' -t -j
+tcping example.com:443 -4 -e --timeout-ms 2000
+tcping example.com:443 -o json --timestamp
+tcping example.com:443 -o csv -D
 ```
 
-## Output formats
+| Option | Meaning |
+|---|---|
+| `-c`, `--count` | Number of attempts; default `4`, must be positive |
+| `-t`, `--continuous` | Run until interrupted; conflicts with an explicit count |
+| `-e`, `--exit-on-success` | Stop successfully at the first open connection |
+| `-j`, `--jitter` | Jitter between successive successful connections and p95 |
+| `-o`, `--output-mode` | `normal`, `json`, `csv`, or `md` |
+| `--color` | `auto` (default), `always`, or `never`; colors status text in normal output |
+| `--timeout-ms` | Connection deadline per attempt; default `2000` |
+| `--resolve-timeout-ms` | Separate DNS resolution deadline; default `5000` |
+| `--interval-ms` | Minimum interval between attempt starts; default `1000` |
+| `-4`, `--ipv4` / `-6`, `--ipv6` | Select an address family |
+| `--timestamp[=iso8601\|unix]` | Include timestamps; bare flag uses UTC RFC 3339 |
+| `--date` | Alias for `--timestamp` |
+| `-D` | Shorthand for `--timestamp=unix` |
+| `-h` / `-V` | Help / version |
 
-- `-o json`: NDJSON (one JSON object per line) with `schema=tcping.v1` and `record=probe|summary`
-- `-o csv`: single CSV stream with a header row, with `schema=tcping.v1` and `record=probe|summary`
-- When `--timestamp` or `-D` is enabled, JSON and CSV upgrade to `schema=tcping.v2` and add `timestamp` (RFC 3339 UTC) plus `timestamp_unix_ms` fields to every `probe` and `summary` record
-- Human-oriented outputs (`normal`, `color`, `md`) use the requested style directly: `iso8601` renders RFC 3339 UTC with millisecond precision, `unix` renders `seconds.millis`
+All durations must be positive. IPv6 literals require brackets. An optional timestamp value uses `=` so that `--timestamp example.com:443` unambiguously treats the address as the target.
 
-## Library API
+### Colors
 
-`tcping-rs` can also be used as a Rust library. The library API does not write to stdout; it returns structured session data or emits structured events for long-running probes.
+Normal output colors only the status text: green for `open`, red for refused connections and other connection errors, yellow for timeouts or unreachable hosts/networks, and gray for cancellation. Addresses, RTT values, and statistics retain the terminal's default color. Basic terminal palette colors adapt to the selected terminal theme.
 
-For a minimal library dependency without the CLI-only `clap` / `serde_json` stack, disable default features:
+`--color auto` enables color on a terminal and disables it for pipes, files, `TERM=dumb`, or a nonempty [`NO_COLOR`](https://no-color.org/) environment variable. `--color always` explicitly forces status colors, including in pipes and when `NO_COLOR` is set. `--color never` disables them. JSON, CSV, and Markdown never receive ANSI color codes, including with `--color always`.
+
+```sh
+tcping example.com:443                      # automatic terminal colors
+tcping example.com:443 --color never       # plain text
+tcping example.com:443 --color always | less -R
+NO_COLOR=1 tcping example.com:443
+```
+
+The previous `-o color` format is removed; use `--color always` with normal output instead.
+
+### Outcomes and timing
+
+```text
+Resolved cloudflare.com -> 104.16.132.229  (DNS 1.1.1.1)  in 77.5638 ms
+Probing 127.0.0.1:8080/tcp - open - 0.2531 ms
+Probing 127.0.0.1:8081/tcp - FAILED: connection refused (port closed)
+Probing 192.0.2.1:443/tcp - FAILED: request timed out
+```
+
+Only successful TCP connections have an RTT. A refused connection fails immediately; it does not wait for the timeout. Other failures distinguish host/network unreachable, permission denied, connection reset/aborted, and an unavailable local address. Cancellation is a separate outcome.
+
+The deadline is a scheduling boundary, not a real-time guarantee. OS and executor scheduling can make the observed duration exceed `2000 ms`, including fractional milliseconds. Elapsed time is measured with a monotonic clock and never clamped to the configured timeout. A connection observed at or after its deadline is classified as timed out. When cancellation and a deadline are both ready, cancellation takes priority.
+
+Attempts run sequentially. Their starts are spaced by at least `--interval-ms`; a slow attempt allows the next to start immediately after it finishes, without a burst of missed attempts. DNS time is excluded from connection RTT. The session duration includes DNS, probing, and intervening waits.
+
+DNS uses Hickory's async resolver with system DNS configuration and the hosts file. It does not reproduce every OS name-service extension, such as NSS plugins or mDNS. IP literals bypass DNS. Resolution occurs once per session: after family filtering and deduplication, the first address is used for every attempt. There is no connection failover that could silently change the endpoint being measured.
+
+`(DNS 1.1.1.1)` identifies the directly queried DNS server whose address result was accepted. Each upstream lookup keeps its A/AAAA and CNAME queries on one server; configured upstreams are queried with bounded concurrency, and the first successful address result wins. Unsuccessful or unused servers are not listed. This identifies the directly contacted resolver, including a local forwarder such as `127.0.0.53`; it cannot reveal that forwarder's own upstreams or whether its answer came from its cache.
+
+Local hosts-file results display `(hosts)`. Repeated library lookups can use a TTL-aware local cache and display `(DNS cache)` without naming a server as if it had just answered. The cache retains up to 64 hostnames per resolver; zero-TTL answers are not cached. JSON and CSV expose `source` (`dns`, `cache`, `hosts`, `literal`, or `unknown`) and `dns_server` (the responder IP for fresh DNS results; JSON `null` or an empty CSV field otherwise), alongside the candidates and selected address. Use an IP literal to choose an exact endpoint.
+
+Statistics count open, failed, timed-out, and cancelled attempts separately. The connection failure rate is `(failed + timed_out) / (open + failed + timed_out)`, excluding cancellation. It is absent when no attempt completed. RTT statistics include successful connections only. Jitter is the absolute difference between successive successful RTTs, even if failures occur between them. The first success has no jitter. The p95 is interpolated exactly for the first 100 jitter samples, then estimated using the constant-memory P² algorithm.
+
+### Exit status
+
+| Code | Meaning |
+|---|---|
+| `0` | All completed attempts succeeded, or `-e` found an open connection |
+| `1` | At least one connection failed/timed out |
+| `2` | Invalid arguments, DNS/setup failure, or an output error |
+| `130` | Cancelled by Ctrl-C, SIGTERM on Unix, or Ctrl-Break on Windows |
+
+A closed downstream pipe exits quietly with `0`. Interruption stops DNS, a pending connection, or the interval wait and emits a final summary when stdout is available.
+
+## Output contract: `tcping.v3`
+
+Version 1.3 includes breaking API changes. Machine output always uses `schema: "tcping.v3"`, with or without timestamps. There are no legacy v1/v2 serializers.
+
+JSON is NDJSON: one object per event, with `record` equal to `resolved`, `probe`, or `summary`. CSV uses the same event model, a single fixed header, and empty fields for missing values. It quotes commas, quotes, and line breaks. Markdown and normal text show explicit failure reasons and omit RTT for failed attempts.
+
+A failed JSON probe looks like this:
+
+```json
+{"schema":"tcping.v3","record":"probe","sequence":1,"address":"127.0.0.1:8081","status":"refused","elapsed_ms":0.15,"timeout_ms":2000.0,"rtt_ms":null,"jitter_ms":null,"failure":{"kind":"refused","os_code":111,"message":"Connection refused (os error 111)"}}
+```
+
+`elapsed_ms` measures the attempt regardless of outcome; `rtt_ms` exists only for `open`. Status codes are `open`, `refused`, `host_unreachable`, `network_unreachable`, `permission_denied`, `reset`, `aborted`, `address_unavailable`, `error`, `timeout`, and `cancelled`. OS error codes and messages are platform dependent.
+
+When requested, all JSON events include a `timestamp` object with `utc` (RFC 3339) and `unix_ms` (integer milliseconds). CSV flattens these to `timestamp` and `unix_ms`. The requested timestamp style affects human-readable output; machine fields remain stable. Resolution/probe timestamps mark their start; summary timestamps mark completion.
+
+Summary fields include `stop_reason`, `counts`, `failure_rate_pct`, optional `rtt` min/average/max, `jitter_samples`, and optional `jitter_p95_ms`. CSV flattens the counters and RTT fields. Stop reasons are `count_reached`, `first_success`, `cancelled`, and `handler_stopped`.
+
+## Rust library
+
+Disable default features when embedding the engine:
 
 ```toml
 [dependencies]
-tcping = { version = "1", default-features = false }
+tcping = { version = "1.3", default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
 ```
 
 ```rust
 use std::time::Duration;
-use tcping::{PingOptions, Target, run_collect_async};
+use tcping::{Engine, SessionConfig, SessionError};
 
-async fn example() -> tcping::Result<()> {
-    let target = Target::parse("github.com:443")?;
-    let options = PingOptions::new(target)
+async fn example() -> Result<(), SessionError> {
+    let config = SessionConfig::new("example.com:443".parse()?)
         .with_count(4)?
-        .with_timeout(Duration::from_millis(2_000))
-        .jitter(true)
-        .timestamps(true);
-
-    let session = run_collect_async(options).await?;
-    println!("{:?}", session.summary);
+        .with_connect_timeout(Duration::from_secs(2))?
+        .jitter(true);
+    let session = Engine::default().collect(&config).await?;
+    for probe in session.probes() {
+        println!("{}: {:?}", probe.address(), probe.outcome());
+    }
     Ok(())
 }
 ```
 
-For continuous monitoring, use `run_with_handler_async` or `run_with_handler_until` and consume `PingEvent::Probe` / `PingEvent::Summary` as they are produced.
+The caller supplies a Tokio runtime with I/O and time enabled. The library does not create a runtime, install signal handlers, or write to stdout. Domain values use `Duration`, `SystemTime`, and typed outcomes; CLI exit codes and serialization belong to adapters.
 
-Features:
+`Engine::run` streams borrowed `Event` values to a handler. `run_until` also accepts a cancellation future. Handlers return `Result<ControlFlow<()>, E>`: `Continue` keeps probing, `Break` ends the session with `HandlerStopped`, and `Err` stops immediately and is returned as `RunError::Handler(E)`. Handlers should return promptly. A successful run emits one terminal summary; setup or handler errors return an error without attempting further events. Cancellation before resolution produces a summary without an address or probes.
 
-- `cli` (enabled by default): builds the `tcping` binary and enables CLI output dependencies
-- `serde`: derives `Serialize` for structured library records
+`collect` and `collect_until` store results for finite sessions only. Continuous sessions require streaming, whose internal memory use is bounded. Dropping the engine's run future drops the active network future; it does not emit a summary. `Resolver` and `Connector` are replaceable async adapters, allowing deterministic tests without external DNS or network access.
 
-## Installation
+| Feature | Purpose |
+|---|---|
+| No default features | Async engine, typed domain model, DNS/TCP adapters |
+| `report` | Versioned `report::Record` DTOs and fallible timestamps; no CLI |
+| `cli` (default) | CLI parsing, process signals, and output writers; enables `report` |
 
-### Download from Releases
+Use `report::Record::from_event` for the same wire contract as the CLI. Domain types deliberately do not implement serialization. The old `PingOptions`, implicit-runtime helpers, public mutable result fields, and v1/v2 schemas have been removed.
 
-Download the precompiled binaries from the [Releases Page](https://github.com/lvillis/tcping-rs/releases).
+## Development
 
-* Navigate to the [Releases](https://github.com/lvillis/tcping-rs/releases) section.
-* Download the appropriate binary for your operating system.
-* Extract the executable and place it in a directory included in your PATH.
-
-### Using Docker
-
-Run `tcping-rs` using the Docker image:
-
-```shell
-docker run --rm docker.io/lvillis/tcping:latest <host:port> [options]
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked
+cargo test --no-default-features --locked
+cargo test --no-default-features --features report --locked
+cargo doc --no-deps --all-features --locked
+docker build -t tcping:local .
+docker run --rm tcping:local --version
 ```
 
-### Using Nix
+The core is separated into validated configuration/targets (`config`, `target`), domain values (`model`), network adapters (`network`), orchestration (`engine`), and online statistics (`stats`). The optional `report` module owns the wire schema. The binary owns argument parsing, signal registration, rendering, and exit codes. Tests exercise virtual-time deadlines and cancellation, network-future disposal, output failures, protocol records, statistics, and real loopback connections.
 
-`tcping-rs` is available in nixpkgs. To install it system wide:
-
-```nix
-  environment.systemPackages = [
-    pkgs.tcping-rs
-  ];
-```
-
-Or spawn in a nix-shell:
-
-```console
-nix-shell -p tcping-rs
-```
-
-## About
-
-This tool allows you to measure the latency to a server using TCP. It is built with Rust and uses the clap library for
-command line argument parsing, plus Tokio for the async loop and timers.
+[MIT license](LICENSE).

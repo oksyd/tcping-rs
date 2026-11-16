@@ -1,23 +1,5 @@
-//! Runtime statistics and data structures.
-//!
-//! [Stats] accumulates per-probe results and emits a final [Summary].
-//! Both [PingResult] and [Summary] are serde-serialisable so the
-//! formatting layer can dump them directly.
-
-use std::net::SocketAddr;
-
-use crate::timestamp::RecordTimestamp;
-
-pub const OUTPUT_SCHEMA_V1: &str = "tcping.v1";
-pub const OUTPUT_SCHEMA_V2: &str = "tcping.v2";
-
-pub fn output_schema(include_timestamps: bool) -> &'static str {
-    if include_timestamps {
-        OUTPUT_SCHEMA_V2
-    } else {
-        OUTPUT_SCHEMA_V1
-    }
-}
+use crate::{Counts, LatencyStats, Outcome, Probe};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 struct P2Quantile {
@@ -112,8 +94,8 @@ impl P2Quantile {
             3
         };
 
-        for i in (k + 1)..5 {
-            self.n[i] += 1;
+        for n in self.n.iter_mut().skip(k + 1) {
+            *n += 1;
         }
         for i in 0..5 {
             self.np[i] += self.dn[i];
@@ -169,224 +151,211 @@ impl P2Quantile {
     }
 }
 
-/// Result of a single probe.
-///
-/// This structure may be serialised as JSON / CSV by the formatter layer.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-pub struct PingResult {
-    pub schema: &'static str,
-    pub record: &'static str,
-    pub timestamp: Option<RecordTimestamp>,
-    pub success: bool,
-    pub duration_ms: f64,
-    pub jitter_ms: Option<f64>,
-    pub addr: SocketAddr,
+pub(crate) struct Statistics {
+    counts: Counts,
+    min: Duration,
+    max: Duration,
+    mean_ns: i128,
+    mean_remainder: i128,
+    previous_rtt: Option<Duration>,
+    jitter_enabled: bool,
+    jitter_samples: u64,
+    jitter_p95: P2Quantile,
+    warmup: Vec<f64>,
 }
 
-/// Roll-up of an entire probing session.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-pub struct Summary {
-    pub schema: &'static str,
-    pub record: &'static str,
-    pub timestamp: Option<RecordTimestamp>,
-    pub addr: SocketAddr,
-    pub total_attempts: usize,
-    pub successful_pings: usize,
-    pub packet_loss: f64,
-    pub min_duration_ms: f64,
-    pub avg_duration_ms: f64,
-    pub max_duration_ms: f64,
-    pub resolve_time_ms: f64,
-    pub jitter_p95_ms: Option<f64>,
-}
-
-impl Summary {
-    /// Map this summary to a conventional Unix process exit code.
-    pub fn exit_code(&self) -> i32 {
-        if self.successful_pings == self.total_attempts && self.total_attempts > 0 {
-            0
-        } else {
-            1
-        }
-    }
-}
-
-/// Mutable accumulator used during a session.
-pub(crate) struct Stats {
-    addr: SocketAddr,
-    sent: usize,
-    ok: usize,
-    total_rtt: f64,
-    min_rtt: f64,
-    max_rtt: f64,
-    last_rtt: Option<f64>,
-    resolve_ms: f64,
-    jitter_p95: Option<P2Quantile>,
-    schema: &'static str,
-}
-
-impl Stats {
-    /// Create a new accumulator.
-    pub(crate) fn new(addr: SocketAddr, resolve_ms: f64, include_timestamps: bool) -> Self {
+impl Statistics {
+    pub(crate) fn new(jitter_enabled: bool) -> Self {
         Self {
-            addr,
-            sent: 0,
-            ok: 0,
-            total_rtt: 0.0,
-            min_rtt: f64::MAX,
-            max_rtt: 0.0,
-            last_rtt: None,
-            resolve_ms,
-            jitter_p95: None,
-            schema: output_schema(include_timestamps),
+            counts: Counts::default(),
+            min: Duration::MAX,
+            max: Duration::ZERO,
+            mean_ns: 0,
+            mean_remainder: 0,
+            previous_rtt: None,
+            jitter_enabled,
+            jitter_samples: 0,
+            jitter_p95: P2Quantile::new(0.95),
+            warmup: Vec::new(),
         }
     }
-
-    /// Feed one probe result and obtain a [PingResult] to hand to the formatter.
-    pub(crate) fn feed(
-        &mut self,
-        success: bool,
-        rtt: f64,
-        want_jitter: bool,
-        timestamp: Option<RecordTimestamp>,
-    ) -> PingResult {
-        self.sent += 1;
-
-        let jitter = if want_jitter && success {
-            self.last_rtt.map(|prev| (rtt - prev).abs())
+    pub(crate) fn observe(&mut self, probe: &Probe) -> Option<Duration> {
+        self.counts.attempted += 1;
+        match probe.outcome() {
+            Outcome::Open => self.counts.open += 1,
+            Outcome::Failed(_) => {
+                self.counts.failed += 1;
+                return None;
+            }
+            Outcome::TimedOut => {
+                self.counts.timed_out += 1;
+                return None;
+            }
+            Outcome::Cancelled => {
+                self.counts.cancelled += 1;
+                return None;
+            }
+        }
+        let elapsed = probe.elapsed();
+        self.min = self.min.min(elapsed);
+        self.max = self.max.max(elapsed);
+        // Carry the remainder: an exact integer mean without an unbounded sum.
+        let count = i128::from(self.counts.open);
+        let adjustment = elapsed.as_nanos() as i128 - self.mean_ns + self.mean_remainder;
+        self.mean_ns += adjustment.div_euclid(count);
+        self.mean_remainder = adjustment.rem_euclid(count);
+        let jitter = self
+            .previous_rtt
+            .replace(elapsed)
+            .filter(|_| self.jitter_enabled)
+            .map(|previous| previous.abs_diff(elapsed));
+        if let Some(jitter) = jitter {
+            self.jitter_samples += 1;
+            let milliseconds = jitter.as_secs_f64() * 1000.0;
+            self.jitter_p95.observe(milliseconds);
+            if self.jitter_samples <= 100 {
+                self.warmup.push(milliseconds);
+            }
+        }
+        jitter
+    }
+    pub(crate) fn counts(&self) -> Counts {
+        self.counts
+    }
+    pub(crate) fn latency(&self) -> Option<LatencyStats> {
+        (self.counts.open != 0).then(|| LatencyStats {
+            min: self.min,
+            average: Duration::new(
+                (self.mean_ns / 1_000_000_000) as u64,
+                (self.mean_ns % 1_000_000_000) as u32,
+            ),
+            max: self.max,
+        })
+    }
+    pub(crate) fn jitter_samples(&self) -> u64 {
+        self.jitter_samples
+    }
+    pub(crate) fn jitter_p95(&self) -> Option<Duration> {
+        let milliseconds = if self.jitter_samples <= 100 {
+            P2Quantile::estimate_from_samples(&self.warmup, 0.95)
         } else {
-            None
-        };
-
-        if let Some(j) = jitter {
-            self.jitter_p95
-                .get_or_insert_with(|| P2Quantile::new(0.95))
-                .observe(j);
-        }
-
-        if success {
-            self.ok += 1;
-            self.total_rtt += rtt;
-            self.min_rtt = self.min_rtt.min(rtt);
-            self.max_rtt = self.max_rtt.max(rtt);
-            self.last_rtt = Some(rtt);
-        }
-
-        PingResult {
-            schema: self.schema,
-            record: "probe",
-            timestamp,
-            success,
-            duration_ms: rtt,
-            jitter_ms: jitter,
-            addr: self.addr,
-        }
-    }
-
-    /// Number of probes recorded so far.
-    pub(crate) fn attempts(&self) -> usize {
-        self.sent
-    }
-
-    /// Produce the final [Summary].
-    pub(crate) fn summary(&self, timestamp: Option<RecordTimestamp>) -> Summary {
-        let packet_loss = if self.sent == 0 {
-            0.0
-        } else {
-            100.0 * (1.0 - self.ok as f64 / self.sent as f64)
-        };
-
-        Summary {
-            schema: self.schema,
-            record: "summary",
-            timestamp,
-            addr: self.addr,
-            total_attempts: self.sent,
-            successful_pings: self.ok,
-            packet_loss,
-            min_duration_ms: if self.ok > 0 { self.min_rtt } else { 0.0 },
-            avg_duration_ms: if self.ok > 0 {
-                self.total_rtt / self.ok as f64
-            } else {
-                0.0
-            },
-            max_duration_ms: if self.ok > 0 { self.max_rtt } else { 0.0 },
-            resolve_time_ms: self.resolve_ms,
-            jitter_p95_ms: self.jitter_p95.as_ref().and_then(|q| q.estimate()),
-        }
+            self.jitter_p95.estimate()
+        }?;
+        Duration::try_from_secs_f64(milliseconds / 1000.0).ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use crate::Failure;
+    use std::{io, time::UNIX_EPOCH};
 
-    fn loopback_addr() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80)
+    fn probe(elapsed: Duration, outcome: Outcome) -> Probe {
+        Probe {
+            sequence: 1,
+            address: "127.0.0.1:443".parse().unwrap(),
+            started_at: UNIX_EPOCH,
+            elapsed,
+            timeout: Duration::from_secs(2),
+            outcome,
+            jitter: None,
+        }
     }
 
     #[test]
-    fn summary_handles_zero_probes() {
-        let stats = Stats::new(loopback_addr(), 0.0, false);
-        let summary = stats.summary(None);
-        assert_eq!(summary.total_attempts, 0);
-        assert_eq!(summary.packet_loss, 0.0);
+    fn no_completed_connections_have_no_latency_or_failure_rate() {
+        let mut stats = Statistics::new(true);
+        assert!(stats.latency().is_none());
+        assert!(stats.jitter_p95().is_none());
+        stats.observe(&probe(Duration::from_millis(50), Outcome::Cancelled));
+        assert_eq!(stats.counts().failure_ratio(), None);
+        assert!(stats.latency().is_none());
     }
 
     #[test]
-    fn jitter_is_difference_between_successive_successes() {
-        let mut stats = Stats::new(loopback_addr(), 0.0, false);
-        let first = stats.feed(true, 10.0, true, None);
-        assert_eq!(first.jitter_ms, None);
-
-        let second = stats.feed(true, 15.0, true, None);
-        assert_eq!(second.jitter_ms, Some(5.0));
+    fn failures_are_excluded_and_zero_rtt_is_a_valid_sample() {
+        let mut stats = Statistics::new(true);
+        stats.observe(&probe(Duration::ZERO, Outcome::Open));
+        stats.observe(&probe(Duration::from_secs(2), Outcome::TimedOut));
+        stats.observe(&probe(
+            Duration::from_secs(1),
+            Outcome::Failed(Failure::from_io(io::ErrorKind::ConnectionRefused.into())),
+        ));
+        assert_eq!(
+            stats.observe(&probe(Duration::from_millis(40), Outcome::Open)),
+            Some(Duration::from_millis(40))
+        );
+        let latency = stats.latency().unwrap();
+        assert_eq!(latency.min(), Duration::ZERO);
+        assert_eq!(latency.average(), Duration::from_millis(20));
+        assert_eq!(latency.max(), Duration::from_millis(40));
+        assert_eq!(stats.counts().failure_ratio(), Some(0.5));
     }
 
     #[test]
-    fn jitter_p95_is_reported_when_enabled() {
-        let mut stats = Stats::new(loopback_addr(), 0.0, false);
-        stats.feed(true, 10.0, true, None);
-        stats.feed(true, 20.0, true, None); // jitter 10
-        stats.feed(true, 25.0, true, None); // jitter 5
-        stats.feed(true, 40.0, true, None); // jitter 15
-
-        let summary = stats.summary(None);
-        assert_eq!(summary.jitter_p95_ms, Some(14.5));
+    fn integer_mean_does_not_accumulate_rounding_error() {
+        let mut stats = Statistics::new(false);
+        stats.observe(&probe(Duration::ZERO, Outcome::Open));
+        for _ in 0..1000 {
+            stats.observe(&probe(Duration::from_nanos(10), Outcome::Open));
+        }
+        assert_eq!(stats.latency().unwrap().average(), Duration::from_nanos(9));
+        for _ in 0..1000 {
+            stats.observe(&probe(Duration::ZERO, Outcome::Open));
+        }
+        assert_eq!(stats.latency().unwrap().average(), Duration::from_nanos(4));
     }
 
     #[test]
-    fn jitter_p95_is_none_when_disabled() {
-        let mut stats = Stats::new(loopback_addr(), 0.0, false);
-        stats.feed(true, 10.0, false, None);
-        stats.feed(true, 20.0, false, None);
-
-        let summary = stats.summary(None);
-        assert_eq!(summary.jitter_p95_ms, None);
+    fn jitter_can_be_disabled_without_affecting_rtt() {
+        let mut stats = Statistics::new(false);
+        for ms in [10, 40, 25] {
+            assert_eq!(
+                stats.observe(&probe(Duration::from_millis(ms), Outcome::Open)),
+                None
+            );
+        }
+        assert_eq!(
+            stats.latency().unwrap().average(),
+            Duration::from_millis(25)
+        );
+        assert_eq!(stats.jitter_samples(), 0);
+        assert_eq!(stats.jitter_p95(), None);
+        assert!(stats.warmup.is_empty());
     }
 
     #[test]
-    fn jitter_is_only_computed_for_successes() {
-        let mut stats = Stats::new(loopback_addr(), 0.0, false);
-        let first = stats.feed(true, 10.0, true, None);
-        assert_eq!(first.jitter_ms, None);
-
-        let failed = stats.feed(false, 10_000.0, true, None);
-        assert_eq!(failed.jitter_ms, None);
-
-        let second = stats.feed(true, 20.0, true, None);
-        assert_eq!(second.jitter_ms, Some(10.0));
+    fn p95_is_exact_during_warmup_then_uses_bounded_storage() {
+        let mut stats = Statistics::new(true);
+        let mut rtt = 0;
+        stats.observe(&probe(Duration::ZERO, Outcome::Open));
+        for jitter in 1..=10_000 {
+            rtt += jitter;
+            stats.observe(&probe(Duration::from_micros(rtt), Outcome::Open));
+            if jitter == 100 {
+                assert_eq!(stats.jitter_p95(), Some(Duration::from_nanos(95_050)));
+            }
+        }
+        let p95 = stats.jitter_p95().unwrap().as_micros();
+        assert!((9400..=9600).contains(&p95), "p95 = {p95}");
+        assert_eq!(stats.warmup.len(), 100);
+        assert_eq!(stats.jitter_p95.initial.len(), 5);
     }
 
     #[test]
-    fn schema_upgrades_only_when_timestamps_are_enabled() {
-        let without_timestamps = Stats::new(loopback_addr(), 0.0, false);
-        assert_eq!(without_timestamps.summary(None).schema, OUTPUT_SCHEMA_V1);
-
-        let with_timestamps = Stats::new(loopback_addr(), 0.0, true);
-        assert_eq!(with_timestamps.summary(None).schema, OUTPUT_SCHEMA_V2);
+    fn quantile_handles_constant_and_nonmonotonic_samples() {
+        let mut constant = P2Quantile::new(0.95);
+        let mut shuffled = P2Quantile::new(0.95);
+        let mut samples = Vec::new();
+        for index in 0..10_000 {
+            constant.observe(0.0);
+            let sample = ((index * 7919) % 10_000) as f64;
+            samples.push(sample);
+            shuffled.observe(sample);
+        }
+        assert_eq!(constant.estimate(), Some(0.0));
+        let exact = P2Quantile::estimate_from_samples(&samples, 0.95).unwrap();
+        assert!((shuffled.estimate().unwrap() - exact).abs() < 100.0);
     }
 }
