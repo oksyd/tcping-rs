@@ -1,3 +1,17 @@
+## [1.3.1] - 2026-11-16
+
+### 🐛 Bug Fixes
+
+- *(cli)* Refine error details, timestamps, and summary wording
+
+### 🚜 Refactor
+
+- [**breaking**] Redesign async probe engine and CLI output
+## [1.2.27] - 2026-04-25
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tcping version 1.2.27
 ## [1.2.26] - 2026-04-08
 
 ### 🐛 Bug Fixes
