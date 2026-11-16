@@ -1,53 +1,66 @@
-name: Docker Publish
+name: Publish release image
 
 on:
-  push:
-    branches:
-      - main
-
-concurrency:
-  group: docker-publish-${{ github.ref }}
-  cancel-in-progress: true
+  release:
+    types: [published]
 
 permissions:
   contents: read
   packages: write
 
-env:
-  CONTEXT: .
-  GHCR_TAG: ghcr.io/oksyd/tcping:latest
-  BUILDER_NAME: tcping-builder
+concurrency:
+  group: publish-release-image
+  queue: max
 
 jobs:
-  job1:
-    name: latest
-    runs-on: ubuntu-latest
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name }}
+      PRERELEASE: ${{ github.event.release.prerelease }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install QEMU binfmt handlers
-        run: docker run --rm --privileged tonistiigi/binfmt --install arm64
-
-      - name: Create buildx builder
+      - name: Package released binaries and push to GHCR
+        shell: bash
         run: |
-          docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
-          docker buildx inspect --bootstrap
+          version="${TAG#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)*$ ]]
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tcping"
+          build="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          gh release download "$TAG" --dir dist \
+            --pattern "tcping-x86_64-unknown-linux-musl.tar.gz" \
+            --pattern "tcping-aarch64-unknown-linux-musl.tar.gz" \
+            --pattern SHA256SUMS
+          (cd dist && sha256sum --check --ignore-missing SHA256SUMS)
 
-      - name: Login to ghcr.io
-        env:
-          GHCR_USER: ${{ github.repository_owner }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "${GHCR_TOKEN}" | docker login ghcr.io --username "${GHCR_USER}" --password-stdin
+          printf '%s\n' 'FROM scratch' 'COPY tcping /usr/local/bin/tcping' \
+            'USER 65532:65532' 'ENTRYPOINT ["/usr/local/bin/tcping"]' > "$RUNNER_TEMP/Dockerfile"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_REPOSITORY_OWNER" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
 
-      - name: Build and push
-        run: |
-          docker buildx build \
-            --builder "${BUILDER_NAME}" \
-            --platform linux/amd64,linux/arm64 \
-            --file Dockerfile \
-            --push \
-            --cache-from "type=registry,ref=${GHCR_TAG}" \
-            --cache-to type=inline \
-            --tag "${GHCR_TAG}" \
-            "${CONTEXT}"
+          digests=()
+          for arch in amd64 arm64; do
+            target=x86_64-unknown-linux-musl
+            if [[ "$arch" == arm64 ]]; then target=aarch64-unknown-linux-musl; fi
+            staging="tcping-$target"
+            mkdir -p "$arch"
+            tar -xzf "dist/$staging.tar.gz" -C "$arch" --strip-components=1 "$staging/tcping"
+            tag="$image:build-$build-$arch"
+            docker build --platform "linux/$arch" --file "$RUNNER_TEMP/Dockerfile" \
+              --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "org.opencontainers.image.version=$version" \
+              --tag "$tag" "$arch"
+            if [[ "$arch" == amd64 ]]; then
+              test "$(docker run --rm "$tag" --version)" = "tcping $version"
+            fi
+            docker push "$tag"
+            digests+=("$(docker image inspect "$tag" --format '{{index .RepoDigests 0}}')")
+          done
+          docker buildx imagetools create --tag "$image:${version//+/_}" "${digests[@]}"
+          if [[ "$PRERELEASE" == false ]] && \
+            [[ "$(gh api "repos/$GH_REPO/releases/latest" --jq '.tag_name')" == "$TAG" ]]; then
+            docker buildx imagetools create --tag "$image:latest" "${digests[@]}"
+          fi

@@ -20,6 +20,7 @@ macro_rules! columns {
 columns!(
     record,
     schema,
+    mode,
     timestamp,
     unix_ms,
     target,
@@ -62,6 +63,7 @@ pub(super) fn write_record(
 ) -> io::Result<()> {
     let mut row = Row {
         schema: record.schema.into(),
+        mode: record.mode.into(),
         ..Row::default()
     };
     if let Some(timestamp) = &record.timestamp {

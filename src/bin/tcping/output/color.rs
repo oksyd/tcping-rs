@@ -19,7 +19,7 @@ pub(super) fn status(outcome: &Outcome, text: &str, enabled: bool) -> String {
         return text.to_owned();
     }
     let color = match outcome {
-        Outcome::Open => AnsiColor::Green,
+        Outcome::Open { .. } => AnsiColor::Green,
         Outcome::Cancelled => AnsiColor::BrightBlack,
         Outcome::TimedOut => AnsiColor::Yellow,
         Outcome::Failed(failure)

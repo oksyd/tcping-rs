@@ -1,5 +1,9 @@
 use crate::{ConfigError, Target};
-use std::{net::SocketAddr, num::NonZeroUsize, time::Duration};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU64, NonZeroUsize},
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AddressFamily {
@@ -36,7 +40,7 @@ pub struct SessionConfig {
     pub(crate) target: Target,
     pub(crate) count: ProbeCount,
     pub(crate) interval: Duration,
-    pub(crate) connect_timeout: Duration,
+    pub(crate) probe_timeout: Duration,
     pub(crate) resolve_timeout: Duration,
     pub(crate) family: AddressFamily,
     pub(crate) exit_on_success: bool,
@@ -44,13 +48,18 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
+    pub const DEFAULT_COUNT: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+    pub const DEFAULT_INTERVAL_MS: NonZeroU64 = NonZeroU64::new(1000).unwrap();
+    pub const DEFAULT_PROBE_TIMEOUT_MS: NonZeroU64 = NonZeroU64::new(2000).unwrap();
+    pub const DEFAULT_RESOLVE_TIMEOUT_MS: NonZeroU64 = NonZeroU64::new(5000).unwrap();
+
     pub fn new(target: Target) -> Self {
         Self {
             target,
-            count: ProbeCount::Finite(NonZeroUsize::MIN.saturating_add(3)),
-            interval: Duration::from_secs(1),
-            connect_timeout: Duration::from_secs(2),
-            resolve_timeout: Duration::from_secs(5),
+            count: ProbeCount::Finite(Self::DEFAULT_COUNT),
+            interval: Duration::from_millis(Self::DEFAULT_INTERVAL_MS.get()),
+            probe_timeout: Duration::from_millis(Self::DEFAULT_PROBE_TIMEOUT_MS.get()),
+            resolve_timeout: Duration::from_millis(Self::DEFAULT_RESOLVE_TIMEOUT_MS.get()),
             family: AddressFamily::Any,
             exit_on_success: false,
             jitter: false,
@@ -69,9 +78,9 @@ impl SessionConfig {
         self.interval = interval;
         Ok(self)
     }
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Result<Self, ConfigError> {
-        validate_duration(timeout, "connection timeout")?;
-        self.connect_timeout = timeout;
+    pub fn with_probe_timeout(mut self, timeout: Duration) -> Result<Self, ConfigError> {
+        validate_duration(timeout, "probe timeout")?;
+        self.probe_timeout = timeout;
         Ok(self)
     }
     pub fn with_resolve_timeout(mut self, timeout: Duration) -> Result<Self, ConfigError> {
@@ -100,8 +109,8 @@ impl SessionConfig {
     pub fn interval(&self) -> Duration {
         self.interval
     }
-    pub fn connect_timeout(&self) -> Duration {
-        self.connect_timeout
+    pub fn probe_timeout(&self) -> Duration {
+        self.probe_timeout
     }
     pub fn resolve_timeout(&self) -> Duration {
         self.resolve_timeout

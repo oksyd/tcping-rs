@@ -181,8 +181,11 @@ impl Statistics {
     }
     pub(crate) fn observe(&mut self, probe: &Probe) -> Option<Duration> {
         self.counts.attempted += 1;
-        match probe.outcome() {
-            Outcome::Open => self.counts.open += 1,
+        let rtt = match probe.outcome() {
+            Outcome::Open { rtt } => {
+                self.counts.open += 1;
+                *rtt
+            }
             Outcome::Failed(_) => {
                 self.counts.failed += 1;
                 return None;
@@ -195,20 +198,19 @@ impl Statistics {
                 self.counts.cancelled += 1;
                 return None;
             }
-        }
-        let elapsed = probe.elapsed();
-        self.min = self.min.min(elapsed);
-        self.max = self.max.max(elapsed);
+        };
+        self.min = self.min.min(rtt);
+        self.max = self.max.max(rtt);
         // Carry the remainder: an exact integer mean without an unbounded sum.
         let count = i128::from(self.counts.open);
-        let adjustment = elapsed.as_nanos() as i128 - self.mean_ns + self.mean_remainder;
+        let adjustment = rtt.as_nanos() as i128 - self.mean_ns + self.mean_remainder;
         self.mean_ns += adjustment.div_euclid(count);
         self.mean_remainder = adjustment.rem_euclid(count);
         let jitter = self
             .previous_rtt
-            .replace(elapsed)
+            .replace(rtt)
             .filter(|_| self.jitter_enabled)
-            .map(|previous| previous.abs_diff(elapsed));
+            .map(|previous| previous.abs_diff(rtt));
         if let Some(jitter) = jitter {
             self.jitter_samples += 1;
             let milliseconds = jitter.as_secs_f64() * 1000.0;
@@ -253,6 +255,7 @@ mod tests {
 
     fn probe(elapsed: Duration, outcome: Outcome) -> Probe {
         Probe {
+            mode: crate::ProbeMode::Connect,
             sequence: 1,
             address: "127.0.0.1:443".parse().unwrap(),
             started_at: UNIX_EPOCH,
@@ -261,6 +264,10 @@ mod tests {
             outcome,
             jitter: None,
         }
+    }
+
+    fn open(rtt: Duration) -> Probe {
+        probe(rtt, Outcome::Open { rtt })
     }
 
     #[test]
@@ -276,14 +283,14 @@ mod tests {
     #[test]
     fn failures_are_excluded_and_zero_rtt_is_a_valid_sample() {
         let mut stats = Statistics::new(true);
-        stats.observe(&probe(Duration::ZERO, Outcome::Open));
+        stats.observe(&open(Duration::ZERO));
         stats.observe(&probe(Duration::from_secs(2), Outcome::TimedOut));
         stats.observe(&probe(
             Duration::from_secs(1),
             Outcome::Failed(Failure::from_io(io::ErrorKind::ConnectionRefused.into())),
         ));
         assert_eq!(
-            stats.observe(&probe(Duration::from_millis(40), Outcome::Open)),
+            stats.observe(&open(Duration::from_millis(40))),
             Some(Duration::from_millis(40))
         );
         let latency = stats.latency().unwrap();
@@ -296,13 +303,13 @@ mod tests {
     #[test]
     fn integer_mean_does_not_accumulate_rounding_error() {
         let mut stats = Statistics::new(false);
-        stats.observe(&probe(Duration::ZERO, Outcome::Open));
+        stats.observe(&open(Duration::ZERO));
         for _ in 0..1000 {
-            stats.observe(&probe(Duration::from_nanos(10), Outcome::Open));
+            stats.observe(&open(Duration::from_nanos(10)));
         }
         assert_eq!(stats.latency().unwrap().average(), Duration::from_nanos(9));
         for _ in 0..1000 {
-            stats.observe(&probe(Duration::ZERO, Outcome::Open));
+            stats.observe(&open(Duration::ZERO));
         }
         assert_eq!(stats.latency().unwrap().average(), Duration::from_nanos(4));
     }
@@ -311,10 +318,7 @@ mod tests {
     fn jitter_can_be_disabled_without_affecting_rtt() {
         let mut stats = Statistics::new(false);
         for ms in [10, 40, 25] {
-            assert_eq!(
-                stats.observe(&probe(Duration::from_millis(ms), Outcome::Open)),
-                None
-            );
+            assert_eq!(stats.observe(&open(Duration::from_millis(ms))), None);
         }
         assert_eq!(
             stats.latency().unwrap().average(),
@@ -329,10 +333,10 @@ mod tests {
     fn p95_is_exact_during_warmup_then_uses_bounded_storage() {
         let mut stats = Statistics::new(true);
         let mut rtt = 0;
-        stats.observe(&probe(Duration::ZERO, Outcome::Open));
+        stats.observe(&open(Duration::ZERO));
         for jitter in 1..=10_000 {
             rtt += jitter;
-            stats.observe(&probe(Duration::from_micros(rtt), Outcome::Open));
+            stats.observe(&open(Duration::from_micros(rtt)));
             if jitter == 100 {
                 assert_eq!(stats.jitter_p95(), Some(Duration::from_nanos(95_050)));
             }

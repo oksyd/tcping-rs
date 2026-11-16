@@ -1,213 +1,230 @@
-name: release
+name: Prepare release draft
 
 on:
   push:
-    tags:
-      - '*'
+    tags: ['[0-9]*', 'v[0-9]*']
+
+permissions:
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 env:
-  PROJECT: tcping
-  RUST_TOOLCHAIN: 1.100.0
+  TAG: ${{ github.ref_name }}
   CROSS_VERSION: v0.2.5
   CROSS_X86_64_UNKNOWN_LINUX_MUSL_SHA256: a486cefa6cb486971b97be321ea9dfc2e90c1979550295314a368f53fab6d588
   GIT_CLIFF_VERSION: v2.12.0
   GIT_CLIFF_X86_64_UNKNOWN_LINUX_MUSL_SHA256: c89a7bc55f3c51f391938aa3fa560125109695c1930d927879daea68dd786420
 
 jobs:
+  check:
+    uses: ./.github/workflows/ci.yaml
+
   build:
+    needs: check
     name: build-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     permissions:
       contents: read
+    outputs:
+      artifact-count: ${{ format('{0}', strategy.job-total) }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            use-cross: false
-          - os: ubuntu-latest
+            cross: false
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            use-cross: true
-          - os: ubuntu-latest
+            cross: false
+          - os: ubuntu-24.04
             target: arm-unknown-linux-gnueabihf
-            use-cross: true
-          - os: ubuntu-latest
+            cross: true
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            use-cross: true
-          - os: ubuntu-latest
+            cross: false
+          - os: ubuntu-24.04
             target: armv7-unknown-linux-gnueabihf
-            use-cross: true
-          - os: macos-latest
+            cross: true
+          - os: macos-15
             target: aarch64-apple-darwin
-            use-cross: false
-          - os: windows-latest
+            cross: false
+          - os: windows-2025
             target: x86_64-pc-windows-gnu
-            use-cross: false
-          - os: windows-latest
+            cross: false
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
-            use-cross: false
-
+            cross: false
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      RUSTUP_TOOLCHAIN: ${{ needs.check.outputs.toolchain }}
+      TARGET: ${{ matrix.target }}
+      USE_CROSS: ${{ matrix.cross }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          fetch-depth: 1
-
-      - name: Set version
-        id: version
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
+          ref: ${{ needs.check.outputs.revision }}
+          persist-credentials: false
       - name: Install Rust toolchain
-        shell: bash
-        run: |
-          rustup set profile minimal
-          rustup toolchain install "${RUST_TOOLCHAIN}"
-          rustup override set "${RUST_TOOLCHAIN}"
-          rustup target add --toolchain "${RUST_TOOLCHAIN}" "${{ matrix.target }}"
-
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET"
       - name: Cache Cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ env.RUST_TOOLCHAIN }}-
-
+            ${{ runner.os }}-cargo-registry-${{ env.RUSTUP_TOOLCHAIN }}-
+      - name: Install native musl toolchain
+        if: ${{ contains(matrix.target, 'musl') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
       - name: Install MinGW toolchain
         if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
         shell: powershell
         run: choco install mingw --no-progress --yes
-
       - name: Install cross
-        if: ${{ matrix.use-cross == true }}
-        shell: bash
+        if: ${{ matrix.cross }}
         run: |
           archive="cross-x86_64-unknown-linux-musl.tar.gz"
           url="https://github.com/cross-rs/cross/releases/download/${CROSS_VERSION}/${archive}"
           dir="${RUNNER_TEMP}/cross"
-          mkdir -p "${dir}" "${HOME}/.local/bin"
-          curl -LSsf -H 'User-Agent: github-actions' "${url}" -o "${dir}/${archive}"
-          echo "${CROSS_X86_64_UNKNOWN_LINUX_MUSL_SHA256}  ${dir}/${archive}" | sha256sum -c -
-          tar -xzf "${dir}/${archive}" -C "${dir}"
-          install "${dir}/cross" "${HOME}/.local/bin/cross"
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
-
+          mkdir -p "$dir" "$HOME/.local/bin"
+          curl --fail --show-error --silent --location --retry 3 "$url" -o "$dir/$archive"
+          echo "$CROSS_X86_64_UNKNOWN_LINUX_MUSL_SHA256  $dir/$archive" | sha256sum -c -
+          tar -xzf "$dir/$archive" -C "$dir"
+          install "$dir/cross" "$HOME/.local/bin/cross"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Test Windows and macOS
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' || runner.os == 'macOS' }}
+        run: cargo test --release --locked --target "$TARGET"
       - name: Build
-        shell: bash
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          if [ "${{ matrix.use-cross }}" = "true" ]; then
-            cross build --release --locked --target "${{ matrix.target }}"
+          if [[ "$USE_CROSS" == "true" ]]; then
+            cross build --release --locked --target "$TARGET"
           else
-            cargo build --release --locked --target "${{ matrix.target }}"
+            cargo build --release --locked --target "$TARGET"
           fi
-
+      - name: Smoke test native binary
+        if: ${{ !matrix.cross }}
+        run: |
+          bin="target/$TARGET/release/tcping"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            bin="$bin.exe"
+          fi
+          test "$("$bin" --version)" = "tcping $VERSION"
+          "$bin" --help
+      - name: Check static musl binary
+        if: ${{ contains(matrix.target, 'musl') }}
+        run: |
+          readelf --program-headers "target/$TARGET/release/tcping" > headers.txt
+          if grep -q INTERP headers.txt; then
+            echo "::error::musl binary requires a dynamic loader and cannot run in scratch."
+            exit 1
+          fi
       - name: Package
         id: package
-        shell: bash
         run: |
-          staging="${{ env.PROJECT }}-${{ steps.version.outputs.version }}-${{ matrix.target }}"
-          bin="${{ env.PROJECT }}"
-
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            bin="${bin}.exe"
+          staging="tcping-$TARGET"
+          bin="tcping"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            bin="$bin.exe"
           fi
-
           mkdir "$staging"
           cp README.md LICENSE "$staging/"
-          cp "target/${{ matrix.target }}/release/${bin}" "$staging/"
-
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          cp "target/$TARGET/release/$bin" "$staging/"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
             asset="$staging.zip"
             7z a "$asset" "$staging" >/dev/null
           else
             asset="$staging.tar.gz"
             tar czf "$asset" "$staging"
           fi
-
-          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: ${{ matrix.target }}
+          name: binary-${{ matrix.target }}
           path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
           compression-level: 0
+          retention-days: 7
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
+  draft:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      REVISION: ${{ needs.check.outputs.revision }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.check.outputs.revision }}
           fetch-depth: 0
-
-      - name: Set version
-        id: version
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
+          pattern: binary-*
+          merge-multiple: true
           path: dist
-
-      - name: Collect release assets
-        shell: bash
-        run: |
-          mkdir -p dist/release-assets
-          find dist -mindepth 2 -maxdepth 2 -type f -exec cp {} dist/release-assets/ \;
-
       - name: Generate checksums
-        shell: bash
+        working-directory: dist
+        env:
+          EXPECTED_ASSETS: ${{ needs.build.outputs.artifact-count }}
         run: |
-          cd dist/release-assets
-          find . -maxdepth 1 -type f -printf '%P\n' | sort | xargs sha256sum > SHA256SUMS
-
+          shopt -s nullglob
+          assets=(tcping-*.tar.gz tcping-*.zip)
+          test "${#assets[@]}" -eq "$EXPECTED_ASSETS"
+          printf '%s\n' "${assets[@]}" | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          sha256sum --check SHA256SUMS
       - name: Install git-cliff
-        shell: bash
         run: |
           version="${GIT_CLIFF_VERSION#v}"
-          archive="git-cliff-${version}-x86_64-unknown-linux-musl.tar.gz"
-          url="https://github.com/orhun/git-cliff/releases/download/${GIT_CLIFF_VERSION}/${archive}"
-          dir="${RUNNER_TEMP}/git-cliff"
-          extracted_dir="${dir}/git-cliff-${version}"
-          mkdir -p "${dir}" "${HOME}/.local/bin"
-          curl -LSsf -H 'User-Agent: github-actions' "${url}" -o "${dir}/${archive}"
-          echo "${GIT_CLIFF_X86_64_UNKNOWN_LINUX_MUSL_SHA256}  ${dir}/${archive}" | sha256sum -c -
-          tar -xzf "${dir}/${archive}" -C "${dir}"
-          install "${extracted_dir}/git-cliff" "${HOME}/.local/bin/git-cliff"
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
-
+          archive="git-cliff-$version-x86_64-unknown-linux-musl.tar.gz"
+          url="https://github.com/orhun/git-cliff/releases/download/$GIT_CLIFF_VERSION/$archive"
+          dir="$RUNNER_TEMP/git-cliff"
+          mkdir -p "$dir" "$HOME/.local/bin"
+          curl --fail --show-error --silent --location --retry 3 "$url" -o "$dir/$archive"
+          echo "$GIT_CLIFF_X86_64_UNKNOWN_LINUX_MUSL_SHA256  $dir/$archive" | sha256sum -c -
+          tar -xzf "$dir/$archive" -C "$dir"
+          install "$dir/git-cliff-$version/git-cliff" "$HOME/.local/bin/git-cliff"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Generate changelog
-        shell: bash
-        run: git-cliff --config cliff.toml --latest --tag "${{ steps.version.outputs.version }}" --strip header -o RELEASE_NOTES.md
-
-      - name: Create or update GitHub Release
+        run: git-cliff --config cliff.toml --latest --tag "$TAG" --strip header -o RELEASE_NOTES.md
+      - name: Prepare draft for manual publication
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${{ steps.version.outputs.version }}"
-          title="tcping ${tag}"
-          assets=$(find dist/release-assets -maxdepth 1 -type f | sort)
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" $assets --clobber
-            gh release edit "$tag" --title "$title" --notes-file RELEASE_NOTES.md
-          else
-            gh release create "$tag" $assets --title "$title" --notes-file RELEASE_NOTES.md
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha')" = "$REVISION"
+          release=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
+            jq -sc --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | first // empty')
+          if [[ -n "$release" ]] && [[ "$(jq -r '.draft' <<< "$release")" != true ]]; then
+            echo "Release $TAG is already published; leaving it unchanged."
+            exit 0
           fi
+          prerelease=false
+          if [[ "${VERSION%%+*}" == *-* ]]; then prerelease=true; fi
+          if [[ -z "$release" ]]; then
+            gh release create "$TAG" --verify-tag --target "$REVISION" --draft \
+              --prerelease="$prerelease" --title "tcping $TAG" --notes-file RELEASE_NOTES.md
+          else
+            gh release edit "$TAG" --title "tcping $TAG" --notes-file RELEASE_NOTES.md
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+          echo "Draft ready. Review and publish it manually on GitHub."

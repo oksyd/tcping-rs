@@ -83,18 +83,18 @@ impl Failure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
-    Open,
+    Open { rtt: Duration },
     Failed(Failure),
     TimedOut,
     Cancelled,
 }
 impl Outcome {
     pub fn is_open(&self) -> bool {
-        matches!(self, Self::Open)
+        matches!(self, Self::Open { .. })
     }
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Open => "open",
+            Self::Open { .. } => "open",
             Self::Failed(failure) => failure.kind.code(),
             Self::TimedOut => "timeout",
             Self::Cancelled => "cancelled",
@@ -102,7 +102,7 @@ impl Outcome {
     }
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Open => "open",
+            Self::Open { .. } => "open",
             Self::Failed(failure) => failure.kind.description(),
             Self::TimedOut => "request timed out",
             Self::Cancelled => "probe cancelled",
@@ -112,6 +112,7 @@ impl Outcome {
 
 #[derive(Clone, Debug)]
 pub struct Probe {
+    pub(crate) mode: crate::ProbeMode,
     pub(crate) sequence: u64,
     pub(crate) address: SocketAddr,
     pub(crate) started_at: SystemTime,
@@ -121,6 +122,9 @@ pub struct Probe {
     pub(crate) jitter: Option<Duration>,
 }
 impl Probe {
+    pub fn mode(&self) -> crate::ProbeMode {
+        self.mode
+    }
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -140,7 +144,10 @@ impl Probe {
         &self.outcome
     }
     pub fn rtt(&self) -> Option<Duration> {
-        self.outcome.is_open().then_some(self.elapsed)
+        match self.outcome {
+            Outcome::Open { rtt } => Some(rtt),
+            _ => None,
+        }
     }
     pub fn jitter(&self) -> Option<Duration> {
         self.jitter
@@ -178,6 +185,7 @@ impl ResolutionSource {
 
 #[derive(Clone, Debug)]
 pub struct Resolution {
+    pub(crate) mode: crate::ProbeMode,
     pub(crate) target: Target,
     pub(crate) candidates: Vec<SocketAddr>,
     pub(crate) source: ResolutionSource,
@@ -186,6 +194,9 @@ pub struct Resolution {
     pub(crate) elapsed: Duration,
 }
 impl Resolution {
+    pub fn mode(&self) -> crate::ProbeMode {
+        self.mode
+    }
     pub fn target(&self) -> &Target {
         &self.target
     }
@@ -278,6 +289,7 @@ impl LatencyStats {
 
 #[derive(Clone, Debug)]
 pub struct Summary {
+    pub(crate) mode: crate::ProbeMode,
     pub(crate) target: Target,
     pub(crate) address: Option<SocketAddr>,
     pub(crate) started_at: SystemTime,
@@ -291,6 +303,9 @@ pub struct Summary {
     pub(crate) jitter_p95: Option<Duration>,
 }
 impl Summary {
+    pub fn mode(&self) -> crate::ProbeMode {
+        self.mode
+    }
     pub fn target(&self) -> &Target {
         &self.target
     }
