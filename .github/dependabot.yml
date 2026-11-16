@@ -3,6 +3,8 @@ version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    allow:
+      - dependency-name: "actions/*"
     schedule:
       interval: "daily"
       time: "07:00"

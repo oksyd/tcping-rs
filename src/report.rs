@@ -45,6 +45,7 @@ impl Timestamp {
 #[derive(Debug, Serialize)]
 pub struct Record {
     pub schema: &'static str,
+    pub mode: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<Timestamp>,
     #[serde(flatten)]
@@ -119,6 +120,11 @@ pub fn milliseconds(duration: Duration) -> f64 {
 
 impl Record {
     pub fn from_event(event: Event<'_>, timestamps: bool) -> Result<Self, ReportError> {
+        let mode = match event {
+            Event::Resolved(value) => value.mode(),
+            Event::Probe(value) => value.mode(),
+            Event::Summary(value) => value.mode(),
+        };
         let (at, data) = match event {
             Event::Resolved(value) => (
                 value.started_at(),
@@ -182,6 +188,7 @@ impl Record {
         };
         Ok(Self {
             schema: SCHEMA,
+            mode: mode.code(),
             timestamp: timestamps
                 .then(|| Timestamp::from_system_time(at))
                 .transpose()?,

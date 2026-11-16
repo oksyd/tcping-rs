@@ -73,6 +73,72 @@ fn open_connections_work_in_every_output_mode() {
             assert!(lines.iter().all(|line| line.split(',').count() == width));
             assert!(lines[0].contains("elapsed_ms,timeout_ms,rtt_ms"));
         }
+        if mode == "md" {
+            let rows = text
+                .lines()
+                .filter(|line| line.starts_with('|'))
+                .take(3)
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 3);
+            let width = rows[0].split('|').count();
+            assert!(
+                rows.iter().all(|row| row.split('|').count() == width),
+                "{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn connect_mode_preserves_human_output_and_reports_machine_mode() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    for explicit in [false, true] {
+        for format in ["normal", "md", "json", "csv"] {
+            let mut args = vec!["-o", format];
+            if explicit {
+                args.extend(["--mode", "connect"]);
+            }
+            let output = run(&address, &args);
+            assert!(output.status.success(), "{format}: {output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            match format {
+                "normal" => {
+                    assert!(
+                        text.starts_with(&format!("Probing {address}/tcp - open - ")),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("--- {address} tcping statistics ---")));
+                    assert!(text.contains("Connection failure rate: 0.00%"));
+                }
+                "md" => {
+                    assert!(
+                        text.starts_with(
+                            "| address | status | rtt_ms | jitter_ms |\n|---|---|---|---|\n"
+                        ),
+                        "{text}"
+                    );
+                    assert!(!text.contains("| mode |"));
+                }
+                "json" => {
+                    for line in text.lines() {
+                        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                        assert_eq!(record["mode"], "connect");
+                    }
+                }
+                "csv" => {
+                    let mut lines = text.lines();
+                    let index = lines
+                        .next()
+                        .unwrap()
+                        .split(',')
+                        .position(|column| column == "mode")
+                        .unwrap();
+                    assert!(lines.all(|line| line.split(',').nth(index) == Some("connect")));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 }
 
@@ -213,4 +279,17 @@ fn unix_signals_interrupt_interval_and_emit_a_final_summary() {
         assert_eq!(summary["counts"]["attempted"], 1);
         assert_eq!(summary["counts"]["cancelled"], 0);
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn syn_mode_is_explicitly_unsupported_outside_linux() {
+    let output = run("127.0.0.1:443", &["--mode", "syn"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("only supported on Linux")
+    );
 }

@@ -12,8 +12,9 @@ use std::{
     time::Duration,
 };
 use tcping::{
-    AddressFamily, ConfigError, Connector, Engine, Event, FailureKind, Lookup, Outcome,
-    ResolutionSource, Resolver, RunError, SessionConfig, SessionError, StopReason, Target,
+    AddressFamily, ConfigError, Engine, Event, FailureKind, Lookup, Outcome, ProbeBackend,
+    ProbeMode, ProbeSession, ResolutionSource, Resolver, RunError, SessionConfig, SessionError,
+    StopReason, Target,
 };
 use tokio::{
     sync::Notify,
@@ -62,7 +63,7 @@ impl Default for FakeResolver {
     }
 }
 impl Resolver for FakeResolver {
-    async fn resolve(&self, _: &Target) -> io::Result<Lookup> {
+    async fn resolve(&self, _: &Target, _: AddressFamily) -> io::Result<Lookup> {
         let _guard = self.activity.enter();
         wait(self.delay).await;
         Ok(Lookup {
@@ -95,11 +96,11 @@ impl Step {
         }
     }
 }
-struct FakeConnector {
+struct FakeBackend {
     steps: Mutex<VecDeque<Step>>,
     activity: Arc<Activity>,
 }
-impl FakeConnector {
+impl FakeBackend {
     fn new(steps: impl IntoIterator<Item = Step>) -> Self {
         Self {
             steps: Mutex::new(steps.into_iter().collect()),
@@ -107,15 +108,34 @@ impl FakeConnector {
         }
     }
 }
-impl Connector for FakeConnector {
-    async fn connect(&self, address: SocketAddr) -> io::Result<()> {
-        let _guard = self.activity.enter();
-        self.activity
+impl ProbeBackend for FakeBackend {
+    fn mode(&self) -> ProbeMode {
+        ProbeMode::Connect
+    }
+    fn prepare(&self, address: SocketAddr) -> io::Result<impl ProbeSession> {
+        Ok(FakeProbe {
+            backend: self,
+            address,
+        })
+    }
+}
+struct FakeProbe<'a> {
+    backend: &'a FakeBackend,
+    address: SocketAddr,
+}
+impl ProbeSession for FakeProbe<'_> {
+    async fn probe(&mut self) -> io::Result<Duration> {
+        let address = self.address;
+        let started = Instant::now();
+        let _guard = self.backend.activity.enter();
+        self.backend
+            .activity
             .connections
             .lock()
             .unwrap()
             .push((address, Instant::now()));
         let step = self
+            .backend
             .steps
             .lock()
             .unwrap()
@@ -124,7 +144,7 @@ impl Connector for FakeConnector {
         wait(step.delay).await;
         match step.error {
             Some(error) => Err(error.into()),
-            None => Ok(()),
+            None => Ok(started.elapsed()),
         }
     }
 }
@@ -141,7 +161,7 @@ fn config(count: usize) -> SessionConfig {
         .unwrap()
         .with_interval(Duration::from_millis(100))
         .unwrap()
-        .with_connect_timeout(Duration::from_millis(200))
+        .with_probe_timeout(Duration::from_millis(200))
         .unwrap()
         .with_resolve_timeout(Duration::from_millis(300))
         .unwrap()
@@ -154,7 +174,7 @@ fn keep_going(_: Event<'_>) -> Result<ControlFlow<()>, Infallible> {
 async fn separates_outcomes_and_only_successes_contribute_to_latency_and_jitter() {
     let engine = Engine::new(
         FakeResolver::default(),
-        FakeConnector::new([
+        FakeBackend::new([
             Step::open(10),
             Step::refused(1),
             Step::stalled(),
@@ -192,7 +212,7 @@ async fn separates_outcomes_and_only_successes_contribute_to_latency_and_jitter(
 async fn ready_cancellation_does_not_start_dns_or_connections() {
     let resolver = FakeResolver::default();
     let activity = resolver.activity.clone();
-    let session = Engine::new(resolver, FakeConnector::new([]))
+    let session = Engine::new(resolver, FakeBackend::new([]))
         .collect_until(&config(1), async {})
         .await
         .unwrap();
@@ -209,7 +229,7 @@ async fn cancellation_drops_dns_future() {
         ..FakeResolver::default()
     };
     let activity = resolver.activity.clone();
-    let session = Engine::new(resolver, FakeConnector::new([]))
+    let session = Engine::new(resolver, FakeBackend::new([]))
         .collect_until(&config(1), sleep(Duration::from_millis(50)))
         .await
         .unwrap();
@@ -224,7 +244,7 @@ async fn dns_deadline_drops_future_and_returns_setup_error() {
         ..FakeResolver::default()
     };
     let activity = resolver.activity.clone();
-    let result = Engine::new(resolver, FakeConnector::new([]))
+    let result = Engine::new(resolver, FakeBackend::new([]))
         .collect(&config(1))
         .await;
     assert!(
@@ -234,9 +254,9 @@ async fn dns_deadline_drops_future_and_returns_setup_error() {
 }
 #[tokio::test(start_paused = true)]
 async fn cancellation_drops_connection_and_does_not_count_as_target_failure() {
-    let connector = FakeConnector::new([Step::stalled()]);
-    let activity = connector.activity.clone();
-    let session = Engine::new(FakeResolver::default(), connector)
+    let backend = FakeBackend::new([Step::stalled()]);
+    let activity = backend.activity.clone();
+    let session = Engine::new(FakeResolver::default(), backend)
         .collect_until(&config(2), sleep(Duration::from_millis(50)))
         .await
         .unwrap();
@@ -249,10 +269,7 @@ async fn cancellation_drops_connection_and_does_not_count_as_target_failure() {
 }
 #[tokio::test(start_paused = true)]
 async fn cancellation_during_interval_adds_no_probe() {
-    let engine = Engine::new(
-        FakeResolver::default(),
-        FakeConnector::new([Step::open(10)]),
-    );
+    let engine = Engine::new(FakeResolver::default(), FakeBackend::new([Step::open(10)]));
     let session = engine
         .collect_until(&config(3), sleep(Duration::from_millis(50)))
         .await
@@ -263,19 +280,13 @@ async fn cancellation_during_interval_adds_no_probe() {
 }
 #[tokio::test(start_paused = true)]
 async fn deadline_wins_over_simultaneous_connection_success() {
-    let engine = Engine::new(
-        FakeResolver::default(),
-        FakeConnector::new([Step::open(200)]),
-    );
+    let engine = Engine::new(FakeResolver::default(), FakeBackend::new([Step::open(200)]));
     let session = engine.collect(&config(1)).await.unwrap();
     assert_eq!(session.probes()[0].outcome(), &Outcome::TimedOut);
 }
 #[tokio::test(start_paused = true)]
 async fn cancellation_wins_over_simultaneous_deadline() {
-    let engine = Engine::new(
-        FakeResolver::default(),
-        FakeConnector::new([Step::stalled()]),
-    );
+    let engine = Engine::new(FakeResolver::default(), FakeBackend::new([Step::stalled()]));
     let session = engine
         .collect_until(&config(1), sleep(Duration::from_millis(200)))
         .await
@@ -284,9 +295,9 @@ async fn cancellation_wins_over_simultaneous_deadline() {
 }
 #[tokio::test(start_paused = true)]
 async fn scheduler_delay_is_reported_instead_of_clamped_to_deadline() {
-    let connector = FakeConnector::new([Step::stalled()]);
-    let activity = connector.activity.clone();
-    let engine = Engine::new(FakeResolver::default(), connector);
+    let backend = FakeBackend::new([Step::stalled()]);
+    let activity = backend.activity.clone();
+    let engine = Engine::new(FakeResolver::default(), backend);
     let task = tokio::spawn(async move { engine.collect(&config(1)).await.unwrap() });
     activity.started.notified().await;
     tokio::time::advance(Duration::from_millis(215)).await;
@@ -299,9 +310,9 @@ async fn scheduler_delay_is_reported_instead_of_clamped_to_deadline() {
 }
 #[tokio::test(start_paused = true)]
 async fn probe_schedule_uses_start_intervals_without_catch_up_bursts() {
-    let connector = FakeConnector::new([Step::stalled(), Step::open(10), Step::open(10)]);
-    let activity = connector.activity.clone();
-    Engine::new(FakeResolver::default(), connector)
+    let backend = FakeBackend::new([Step::stalled(), Step::open(10), Step::open(10)]);
+    let activity = backend.activity.clone();
+    Engine::new(FakeResolver::default(), backend)
         .collect(&config(3))
         .await
         .unwrap();
@@ -313,7 +324,7 @@ async fn probe_schedule_uses_start_intervals_without_catch_up_bursts() {
 async fn first_success_stops_after_prior_failure() {
     let engine = Engine::new(
         FakeResolver::default(),
-        FakeConnector::new([Step::refused(1), Step::open(10)]),
+        FakeBackend::new([Step::refused(1), Step::open(10)]),
     );
     let session = engine
         .collect(&config(5).exit_on_success(true))
@@ -330,9 +341,9 @@ async fn filters_and_deduplicates_addresses_then_keeps_one_for_the_session() {
             .to_vec(),
         ..FakeResolver::default()
     };
-    let connector = FakeConnector::new([Step::refused(1), Step::open(1)]);
-    let activity = connector.activity.clone();
-    let session = Engine::new(resolver, connector)
+    let backend = FakeBackend::new([Step::refused(1), Step::open(1)]);
+    let activity = backend.activity.clone();
+    let session = Engine::new(resolver, backend)
         .collect(&config(2).with_family(AddressFamily::Ipv4))
         .await
         .unwrap();
@@ -356,7 +367,7 @@ async fn filters_and_deduplicates_addresses_then_keeps_one_for_the_session() {
 async fn literal_address_bypasses_resolver_and_honors_family() {
     let resolver = FakeResolver::default();
     let activity = resolver.activity.clone();
-    let engine = Engine::new(resolver, FakeConnector::new([Step::open(0)]));
+    let engine = Engine::new(resolver, FakeBackend::new([Step::open(0)]));
     let config = SessionConfig::new(ADDRESS.parse().unwrap())
         .with_count(1)
         .unwrap();
@@ -371,7 +382,7 @@ async fn literal_address_bypasses_resolver_and_honors_family() {
 }
 #[tokio::test(start_paused = true)]
 async fn emits_one_summary_and_stops_when_handler_requests_it() {
-    let engine = Engine::new(FakeResolver::default(), FakeConnector::new([Step::open(1)]));
+    let engine = Engine::new(FakeResolver::default(), FakeBackend::new([Step::open(1)]));
     let mut events = Vec::new();
     let summary = engine
         .run(&config(3), |event| {
@@ -398,7 +409,7 @@ async fn emits_one_summary_and_stops_when_handler_requests_it() {
 }
 #[tokio::test(start_paused = true)]
 async fn output_error_propagates_without_further_events() {
-    let engine = Engine::new(FakeResolver::default(), FakeConnector::new([]));
+    let engine = Engine::new(FakeResolver::default(), FakeBackend::new([]));
     let mut events = 0;
     let result = engine
         .run(&config(3), |_| {
@@ -413,7 +424,7 @@ async fn output_error_propagates_without_further_events() {
 }
 #[tokio::test(start_paused = true)]
 async fn terminal_output_error_is_not_discarded() {
-    let engine = Engine::new(FakeResolver::default(), FakeConnector::new([Step::open(1)]));
+    let engine = Engine::new(FakeResolver::default(), FakeBackend::new([Step::open(1)]));
     let result = engine
         .run(&config(1), |event| {
             if matches!(event, Event::Summary(_)) {
@@ -430,7 +441,7 @@ async fn terminal_output_error_is_not_discarded() {
 }
 #[tokio::test(start_paused = true)]
 async fn continuous_sessions_require_streaming() {
-    let engine = Engine::new(FakeResolver::default(), FakeConnector::new([Step::open(1)]));
+    let engine = Engine::new(FakeResolver::default(), FakeBackend::new([Step::open(1)]));
     let config = config(1).continuous();
     assert!(matches!(
         engine.collect(&config).await,
@@ -452,7 +463,7 @@ async fn real_tcp_connection_and_refusal() {
         .unwrap();
     let engine = Engine::default();
     let session = engine.collect(&config).await.unwrap();
-    assert_eq!(session.probes()[0].outcome(), &Outcome::Open);
+    assert!(session.probes()[0].outcome().is_open());
     drop(listener);
     let session = engine.collect(&config).await.unwrap();
     assert!(
@@ -465,7 +476,7 @@ async fn wire_records_keep_failures_separate_from_rtt_and_use_one_schema() {
     use tcping::report::Record;
     let engine = Engine::new(
         FakeResolver::default(),
-        FakeConnector::new([Step::refused(10)]),
+        FakeBackend::new([Step::refused(10)]),
     );
     let mut records = Vec::new();
     engine
@@ -488,4 +499,73 @@ async fn wire_records_keep_failures_separate_from_rtt_and_use_one_schema() {
     assert!(records[1]["rtt_ms"].is_null());
     assert!(records[2]["rtt"].is_null());
     assert_eq!(records[2]["counts"]["failed"], 1);
+}
+
+struct MeasuredBackend;
+struct MeasuredProbe;
+impl ProbeBackend for MeasuredBackend {
+    fn mode(&self) -> ProbeMode {
+        ProbeMode::Syn
+    }
+    fn prepare(&self, _: SocketAddr) -> io::Result<impl ProbeSession> {
+        Ok(MeasuredProbe)
+    }
+}
+impl ProbeSession for MeasuredProbe {
+    async fn probe(&mut self) -> io::Result<Duration> {
+        sleep(Duration::from_millis(40)).await;
+        Ok(Duration::from_millis(5))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn measured_rtt_excludes_cleanup_and_mode_follows_every_event() {
+    let session = Engine::new(FakeResolver::default(), MeasuredBackend)
+        .collect(&config(1))
+        .await
+        .unwrap();
+    let probe = &session.probes()[0];
+    assert_eq!(probe.elapsed(), Duration::from_millis(40));
+    assert_eq!(probe.rtt(), Some(Duration::from_millis(5)));
+    assert_eq!(
+        session.summary().latency().unwrap().average(),
+        Duration::from_millis(5)
+    );
+    assert_eq!(probe.mode(), ProbeMode::Syn);
+    assert_eq!(session.resolution().unwrap().mode(), ProbeMode::Syn);
+    assert_eq!(session.summary().mode(), ProbeMode::Syn);
+    #[cfg(feature = "report")]
+    for event in [
+        Event::Resolved(session.resolution().unwrap()),
+        Event::Probe(probe),
+        Event::Summary(session.summary()),
+    ] {
+        let record = tcping::report::Record::from_event(event, false).unwrap();
+        assert_eq!(record.mode, "syn");
+    }
+}
+
+struct DeniedBackend;
+impl ProbeBackend for DeniedBackend {
+    fn mode(&self) -> ProbeMode {
+        ProbeMode::Syn
+    }
+    fn prepare(&self, _: SocketAddr) -> io::Result<impl ProbeSession> {
+        Err::<MeasuredProbe, _>(io::ErrorKind::PermissionDenied.into())
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn setup_failure_stops_even_continuous_sessions_without_emitting_probe_results() {
+    let mut events = 0;
+    let error = Engine::new(FakeResolver::default(), DeniedBackend)
+        .run(&config(1).continuous(), |_| {
+            events += 1;
+            Ok::<_, Infallible>(ControlFlow::Continue(()))
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, RunError::Session(SessionError::ProbeSetup { mode: ProbeMode::Syn, source }) if source.kind() == io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(events, 0);
 }

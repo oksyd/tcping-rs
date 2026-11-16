@@ -3,7 +3,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     time::Duration,
 };
-use tcping::{AddressFamily, ConfigError, SessionConfig, Target};
+use tcping::{AddressFamily, ConfigError, ProbeMode, SessionConfig, Target};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -12,7 +12,9 @@ use tcping::{AddressFamily, ConfigError, SessionConfig, Target};
 pub(crate) struct Args {
     #[arg(value_name = "HOST:PORT")]
     pub target: Target,
-    #[arg(short, long, default_value = "4", help = "Total probes to send")]
+    #[arg(long, default_value_t = ProbeMode::default(), help = "Probe mode: connect or syn (Linux, requires CAP_NET_RAW)")]
+    pub mode: ProbeMode,
+    #[arg(short, long, default_value_t = SessionConfig::DEFAULT_COUNT, help = "Total probes to send")]
     pub count: NonZeroUsize,
     #[arg(
         short = 't',
@@ -33,7 +35,7 @@ pub(crate) struct Args {
     #[arg(
         short = 'e',
         long,
-        help = "Stop successfully after the first open connection"
+        help = "Stop successfully after the first open result"
     )]
     pub exit_on_success: bool,
     #[arg(short = 'j', long, help = "Report jitter between successful probes")]
@@ -48,19 +50,19 @@ pub(crate) struct Args {
     pub unix_timestamp: bool,
     #[arg(
         long,
-        default_value = "2000",
-        help = "Connection deadline per probe in milliseconds"
+        default_value_t = SessionConfig::DEFAULT_PROBE_TIMEOUT_MS,
+        help = "Deadline per probe in milliseconds"
     )]
     pub timeout_ms: NonZeroU64,
     #[arg(
         long,
-        default_value = "5000",
+        default_value_t = SessionConfig::DEFAULT_RESOLVE_TIMEOUT_MS,
         help = "DNS resolution deadline in milliseconds"
     )]
     pub resolve_timeout_ms: NonZeroU64,
     #[arg(
         long,
-        default_value = "1000",
+        default_value_t = SessionConfig::DEFAULT_INTERVAL_MS,
         help = "Minimum interval between probe starts in milliseconds"
     )]
     pub interval_ms: NonZeroU64,
@@ -101,7 +103,7 @@ impl Args {
         };
         let config = SessionConfig::new(self.target.clone())
             .with_count(self.count.get())?
-            .with_connect_timeout(Duration::from_millis(self.timeout_ms.get()))?
+            .with_probe_timeout(Duration::from_millis(self.timeout_ms.get()))?
             .with_resolve_timeout(Duration::from_millis(self.resolve_timeout_ms.get()))?
             .with_interval(Duration::from_millis(self.interval_ms.get()))?
             .with_family(family)
@@ -118,6 +120,38 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_match_library_configuration_and_overrides_are_preserved() {
+        let defaults = SessionConfig::new("localhost:80".parse().unwrap());
+        let parsed = Args::try_parse_from(["tcping", "localhost:80"])
+            .unwrap()
+            .config()
+            .unwrap();
+        assert_eq!(parsed.count(), defaults.count());
+        assert_eq!(parsed.interval(), defaults.interval());
+        assert_eq!(parsed.probe_timeout(), defaults.probe_timeout());
+        assert_eq!(parsed.resolve_timeout(), defaults.resolve_timeout());
+        let parsed = Args::try_parse_from([
+            "tcping",
+            "localhost:80",
+            "-c",
+            "7",
+            "--interval-ms",
+            "123",
+            "--timeout-ms",
+            "456",
+            "--resolve-timeout-ms",
+            "789",
+        ])
+        .unwrap()
+        .config()
+        .unwrap();
+        assert_eq!(parsed.count(), tcping::ProbeCount::finite(7).unwrap());
+        assert_eq!(parsed.interval(), Duration::from_millis(123));
+        assert_eq!(parsed.probe_timeout(), Duration::from_millis(456));
+        assert_eq!(parsed.resolve_timeout(), Duration::from_millis(789));
+    }
     #[test]
     fn validates_values_and_conflicts() {
         for args in [
@@ -131,6 +165,7 @@ mod tests {
             vec!["-o", "unknown"],
             vec!["-o", "color"],
             vec!["--color", "unknown"],
+            vec!["--mode", "unknown"],
         ] {
             assert!(
                 Args::try_parse_from(["tcping", "localhost:80"].into_iter().chain(args)).is_err()

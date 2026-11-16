@@ -1,7 +1,7 @@
 use crate::{
-    ConfigError, Connector, DnsResolver, Event, Failure, Lookup, Outcome, Probe, ProbeCount,
-    Resolution, ResolutionSource, Resolver, RunError, Session, SessionConfig, SessionError,
-    StopReason, Summary, TcpConnector, stats::Statistics,
+    ConfigError, DnsResolver, Event, Failure, Lookup, Outcome, Probe, ProbeBackend, ProbeCount,
+    ProbeMode, ProbeSession, Resolution, ResolutionSource, Resolver, RunError, Session,
+    SessionConfig, SessionError, StopReason, Summary, stats::Statistics,
 };
 use std::{
     convert::Infallible,
@@ -13,25 +13,22 @@ use std::{
 use tokio::time::{Instant, sleep_until};
 
 #[derive(Debug)]
-pub struct Engine<R = DnsResolver, C = TcpConnector> {
+pub struct Engine<R = DnsResolver, B = ProbeMode> {
     resolver: R,
-    connector: C,
+    backend: B,
 }
 impl Default for Engine {
     fn default() -> Self {
-        Self::new(DnsResolver::default(), TcpConnector)
+        Self::new(DnsResolver::default(), ProbeMode::Connect)
     }
 }
-impl<R, C> Engine<R, C> {
-    pub fn new(resolver: R, connector: C) -> Self {
-        Self {
-            resolver,
-            connector,
-        }
+impl<R, B> Engine<R, B> {
+    pub fn new(resolver: R, backend: B) -> Self {
+        Self { resolver, backend }
     }
 }
 
-impl<R: Resolver, C: Connector> Engine<R, C> {
+impl<R: Resolver, B: ProbeBackend> Engine<R, B> {
     /// Streams borrowed events. The handler may stop the session or return its own error.
     /// Handlers run inline and must return promptly. The caller provides a Tokio runtime
     /// with I/O and time enabled; the engine never creates a runtime.
@@ -58,7 +55,7 @@ impl<R: Resolver, C: Connector> Engine<R, C> {
         H: FnMut(Event<'_>) -> Result<ControlFlow<()>, E>,
         F: Future<Output = ()>,
     {
-        let mut state = RunState::new(config);
+        let mut state = RunState::new(config, self.backend.mode());
         tokio::pin!(cancel);
         let resolve_started = Instant::now();
         let resolve_wall = SystemTime::now();
@@ -69,7 +66,7 @@ impl<R: Resolver, C: Connector> Engine<R, C> {
                     addresses: vec![address],
                     source: ResolutionSource::Literal,
                 }),
-                None => self.resolver.resolve(&config.target).await,
+                None => self.resolver.resolve(&config.target, config.family).await,
             }
         };
         let lookup = tokio::select! {
@@ -91,6 +88,7 @@ impl<R: Resolver, C: Connector> Engine<R, C> {
         }
         let selected = *candidates.first().ok_or(SessionError::NoAddress)?;
         let resolution = Resolution {
+            mode: state.mode,
             target: config.target.clone(),
             candidates,
             source: lookup.source,
@@ -98,6 +96,13 @@ impl<R: Resolver, C: Connector> Engine<R, C> {
             started_at: resolve_wall,
             elapsed: resolve_started.elapsed(),
         };
+        let mut endpoint =
+            self.backend
+                .prepare(selected)
+                .map_err(|source| SessionError::ProbeSetup {
+                    mode: state.mode,
+                    source,
+                })?;
         state.resolution = Some(resolution);
         if let Some(resolution) = &state.resolution
             && handler(Event::Resolved(resolution))
@@ -116,16 +121,16 @@ impl<R: Resolver, C: Connector> Engine<R, C> {
             }
             let started = Instant::now();
             let started_at = SystemTime::now();
-            let connect_deadline = deadline(started, config.connect_timeout)?;
+            let probe_deadline = deadline(started, config.probe_timeout)?;
             let outcome = tokio::select! {
                 biased;
                 _ = &mut cancel => Outcome::Cancelled,
-                _ = sleep_until(connect_deadline) => Outcome::TimedOut,
-                result = self.connector.connect(selected) => {
-                    if Instant::now() >= connect_deadline { Outcome::TimedOut }
+                _ = sleep_until(probe_deadline) => Outcome::TimedOut,
+                result = endpoint.probe() => {
+                    if Instant::now() >= probe_deadline { Outcome::TimedOut }
                     else {
                         match result {
-                            Ok(()) => Outcome::Open,
+                            Ok(rtt) => Outcome::Open { rtt },
                             Err(error) if error.kind() == io::ErrorKind::TimedOut => Outcome::TimedOut,
                             Err(error) => Outcome::Failed(Failure::from_io(error)),
                         }
@@ -133,11 +138,12 @@ impl<R: Resolver, C: Connector> Engine<R, C> {
                 }
             };
             let mut probe = Probe {
+                mode: state.mode,
                 sequence: state.stats.counts().attempted() + 1,
                 address: selected,
                 started_at,
                 elapsed: started.elapsed(),
-                timeout: config.connect_timeout,
+                timeout: config.probe_timeout,
                 outcome,
                 jitter: None,
             };
@@ -209,6 +215,7 @@ fn deadline(start: Instant, duration: std::time::Duration) -> Result<Instant, Se
 }
 
 struct RunState<'a> {
+    mode: ProbeMode,
     config: &'a SessionConfig,
     started: Instant,
     started_at: SystemTime,
@@ -216,9 +223,10 @@ struct RunState<'a> {
     resolution: Option<Resolution>,
 }
 impl<'a> RunState<'a> {
-    fn new(config: &'a SessionConfig) -> Self {
+    fn new(config: &'a SessionConfig, mode: ProbeMode) -> Self {
         Self {
             config,
+            mode,
             started: Instant::now(),
             started_at: SystemTime::now(),
             stats: Statistics::new(config.jitter),
@@ -230,6 +238,7 @@ impl<'a> RunState<'a> {
         H: FnMut(Event<'_>) -> Result<ControlFlow<()>, E>,
     {
         let summary = Summary {
+            mode: self.mode,
             target: self.config.target.clone(),
             address: self.resolution.as_ref().map(Resolution::selected),
             started_at: self.started_at,

@@ -1,5 +1,5 @@
 use super::{Lookup, Resolver};
-use crate::{ResolutionSource, Target};
+use crate::{AddressFamily, ResolutionSource, Target, target::Host};
 use futures_util::{StreamExt, stream};
 use hickory_resolver::{
     Hosts, TokioResolver,
@@ -7,7 +7,7 @@ use hickory_resolver::{
     net::runtime::TokioRuntimeProvider,
     proto::{
         op::Query,
-        rr::{IntoName, Name, RecordType},
+        rr::{Name, RecordType},
     },
     system_conf::read_system_conf,
 };
@@ -37,6 +37,7 @@ struct Configuration {
 #[derive(Debug)]
 struct CachedLookup {
     name: Name,
+    family: AddressFamily,
     ips: Vec<IpAddr>,
     valid_until: Instant,
 }
@@ -47,26 +48,35 @@ struct Answer {
 }
 
 impl Resolver for DnsResolver {
-    async fn resolve(&self, target: &Target) -> io::Result<Lookup> {
-        if let Some(address) = target.literal_address() {
-            return Ok(Lookup {
-                addresses: vec![address],
-                source: ResolutionSource::Literal,
-            });
-        }
-        let name = target.host().into_name().map_err(io::Error::other)?;
-        let hosts = self
-            .hosts
-            .get_or_try_init(|| async {
-                match Hosts::from_system() {
-                    Ok(hosts) => Ok(hosts),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Hosts::default()),
-                    Err(error) => Err(error),
-                }
-            })
-            .await?;
-        let ips: Vec<_> = [RecordType::A, RecordType::AAAA]
-            .into_iter()
+    async fn resolve(&self, target: &Target, family: AddressFamily) -> io::Result<Lookup> {
+        let name = match target.parsed_host() {
+            Host::Ip(ip) => {
+                let address = SocketAddr::new(*ip, target.port());
+                return Ok(Lookup {
+                    addresses: family
+                        .accepts(&address)
+                        .then_some(address)
+                        .into_iter()
+                        .collect(),
+                    source: ResolutionSource::Literal,
+                });
+            }
+            Host::Name(name) => name,
+        };
+        let hosts = initialize(&self.hosts, || match Hosts::from_system() {
+            Ok(hosts) => Ok(hosts),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Hosts::default()),
+            Err(error) => Err(error),
+        })
+        .await?;
+        let record_types: &[RecordType] = match family {
+            AddressFamily::Any => &[RecordType::A, RecordType::AAAA],
+            AddressFamily::Ipv4 => &[RecordType::A],
+            AddressFamily::Ipv6 => &[RecordType::AAAA],
+        };
+        let ips: Vec<_> = record_types
+            .iter()
+            .copied()
             .filter_map(|kind| hosts.lookup_static_host(&Query::query(name.clone(), kind)))
             .flat_map(|lookup| {
                 lookup
@@ -80,17 +90,15 @@ impl Resolver for DnsResolver {
             return Ok(result(ips, target.port(), ResolutionSource::Hosts));
         }
 
-        if let Some(ips) = self.cached(&name).await {
+        if let Some(ips) = self.cached(name, family).await {
             return Ok(result(ips, target.port(), ResolutionSource::Cache));
         }
-        let configuration = self
-            .configuration
-            .get_or_try_init(|| async {
-                let (config, options) = read_system_conf().map_err(io::Error::other)?;
-                Ok::<_, io::Error>(Configuration { config, options })
-            })
-            .await?;
-        let answer = configuration.lookup(&name).await?;
+        let configuration = initialize(&self.configuration, || {
+            let (config, options) = read_system_conf().map_err(io::Error::other)?;
+            Ok(Configuration { config, options })
+        })
+        .await?;
+        let answer = configuration.lookup(name, family).await?;
         let lookup = result(
             answer.ips.clone(),
             target.port(),
@@ -98,12 +106,16 @@ impl Resolver for DnsResolver {
         );
         if answer.valid_until > Instant::now() {
             let mut cache = self.cache.lock().await;
-            cache.retain(|entry| entry.valid_until > Instant::now() && entry.name != name);
+            cache.retain(|entry| {
+                entry.valid_until > Instant::now()
+                    && !(&entry.name == name && entry.family == family)
+            });
             if cache.len() >= CACHE_CAPACITY {
                 cache.pop_back();
             }
             cache.push_front(CachedLookup {
-                name,
+                name: name.clone(),
+                family,
                 ips: answer.ips,
                 valid_until: answer.valid_until,
             });
@@ -113,10 +125,12 @@ impl Resolver for DnsResolver {
 }
 
 impl DnsResolver {
-    async fn cached(&self, name: &Name) -> Option<Vec<IpAddr>> {
+    async fn cached(&self, name: &Name, family: AddressFamily) -> Option<Vec<IpAddr>> {
         let mut cache = self.cache.lock().await;
         cache.retain(|entry| entry.valid_until > Instant::now());
-        let index = cache.iter().position(|entry| &entry.name == name)?;
+        let index = cache
+            .iter()
+            .position(|entry| &entry.name == name && entry.family == family)?;
         let entry = cache.remove(index)?;
         let ips = entry.ips.clone();
         cache.push_front(entry);
@@ -124,12 +138,24 @@ impl DnsResolver {
     }
 }
 
+async fn initialize<T: Send + Sync + 'static>(
+    cell: &OnceCell<T>,
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<&T> {
+    cell.get_or_try_init(|| async {
+        tokio::task::spawn_blocking(read)
+            .await
+            .map_err(io::Error::other)?
+    })
+    .await
+}
+
 impl Configuration {
-    async fn lookup(&self, name: &Name) -> io::Result<Answer> {
+    async fn lookup(&self, name: &Name, family: AddressFamily) -> io::Result<Answer> {
         // Each attempt owns one upstream, so replies and CNAME follow-ups retain an
         // unambiguous source. Select the first successful complete address lookup.
         let mut lookups = stream::iter(self.config.name_servers.clone())
-            .map(|server| async move { self.lookup_at(name, &server).await })
+            .map(|server| async move { self.lookup_at(name, &server, family).await })
             .buffer_unordered(self.options.num_concurrent_reqs.max(1));
         let mut error = io::Error::new(io::ErrorKind::NotFound, "no DNS servers configured");
         while let Some(result) = lookups.next().await {
@@ -141,11 +167,20 @@ impl Configuration {
         Err(error)
     }
 
-    async fn lookup_at(&self, name: &Name, server: &NameServerConfig) -> io::Result<Answer> {
+    async fn lookup_at(
+        &self,
+        name: &Name,
+        server: &NameServerConfig,
+        family: AddressFamily,
+    ) -> io::Result<Answer> {
         let mut config = self.config.clone();
         config.name_servers = vec![server.clone()];
         let mut options = self.options.clone();
-        options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+        options.ip_strategy = match family {
+            AddressFamily::Any => LookupIpStrategy::Ipv4AndIpv6,
+            AddressFamily::Ipv4 => LookupIpStrategy::Ipv4Only,
+            AddressFamily::Ipv6 => LookupIpStrategy::Ipv6Only,
+        };
         options.use_hosts_file = ResolveHosts::Never;
         // Cache final address sets above, together with their explicit local origin.
         options.cache_size = 0;
@@ -185,15 +220,16 @@ fn result(ips: Vec<IpAddr>, port: u16, source: ResolutionSource) -> Lookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AddressFamily, Engine, ProbeBackend, ProbeMode, ProbeSession, SessionConfig};
     use hickory_resolver::proto::{
         op::{Message, OpCode, ResponseCode},
         rr::{
-            RData, Record,
-            rdata::{A, CNAME},
+            IntoName, RData, Record,
+            rdata::{A, AAAA, CNAME},
         },
     };
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -208,6 +244,9 @@ mod tests {
         Alias,
         Refused,
         Silent,
+        OnlyIpv4,
+        OnlyIpv6,
+        DualStack,
     }
     struct Server {
         config: NameServerConfig,
@@ -232,13 +271,18 @@ mod tests {
                     let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
                     counter.fetch_add(1, Ordering::SeqCst);
                     let request = Message::from_vec(&buffer[..length]).unwrap();
-                    if matches!(reply, Reply::Silent) {
+                    let query = request.queries[0].clone();
+                    if matches!(reply, Reply::Silent)
+                        || matches!(
+                            (reply, query.query_type()),
+                            (Reply::OnlyIpv4, RecordType::AAAA) | (Reply::OnlyIpv6, RecordType::A)
+                        )
+                    {
                         continue;
                     }
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    let query = request.queries[0].clone();
                     let mut response = Message::response(request.metadata.id, OpCode::Query);
                     response.metadata.recursion_available = true;
                     response.add_query(query.clone());
@@ -251,7 +295,9 @@ mod tests {
                                 RData::CNAME(CNAME("answer.test.".parse().unwrap())),
                             ));
                         }
-                        Reply::Address(_) | Reply::Alias if query.query_type() == RecordType::A => {
+                        Reply::Address(_) | Reply::Alias | Reply::OnlyIpv4 | Reply::DualStack
+                            if query.query_type() == RecordType::A =>
+                        {
                             let ttl = match reply {
                                 Reply::Address(ttl) => ttl,
                                 _ => 30,
@@ -260,6 +306,15 @@ mod tests {
                                 query.name().clone(),
                                 ttl,
                                 RData::A(A::new(192, 0, 2, 42)),
+                            ));
+                        }
+                        Reply::OnlyIpv6 | Reply::DualStack
+                            if query.query_type() == RecordType::AAAA =>
+                        {
+                            response.add_answer(Record::from_rdata(
+                                query.name().clone(),
+                                30,
+                                RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
                             ));
                         }
                         _ => {}
@@ -301,15 +356,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_system_initialization_can_be_cancelled_and_retried() {
+        let cell = OnceCell::new();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            initialize(&cell, move || {
+                blocked
+                    .recv_timeout(Duration::from_secs(1))
+                    .map_err(io::Error::other)?;
+                Ok(42)
+            }),
+        )
+        .await;
+        let _ = release.send(());
+        assert!(result.is_err(), "reader blocked the executor: {result:?}");
+        assert!(cell.get().is_none());
+        assert_eq!(*initialize(&cell, || Ok(7)).await.unwrap(), 7);
+        assert_eq!(
+            *initialize(&cell, || panic!("initialized values must be reused"))
+                .await
+                .unwrap(),
+            7
+        );
+    }
+
+    struct Open;
+    impl ProbeBackend for Open {
+        fn mode(&self) -> ProbeMode {
+            ProbeMode::Connect
+        }
+        fn prepare(&self, _: SocketAddr) -> io::Result<impl ProbeSession> {
+            Ok(Ready)
+        }
+    }
+    struct Ready;
+    impl ProbeSession for Ready {
+        async fn probe(&mut self) -> io::Result<std::time::Duration> {
+            Ok(std::time::Duration::ZERO)
+        }
+    }
+
+    #[tokio::test]
+    async fn single_family_does_not_wait_for_the_other_record_type() {
+        for (family, reply) in [
+            (AddressFamily::Ipv4, Reply::OnlyIpv4),
+            (AddressFamily::Ipv6, Reply::OnlyIpv6),
+        ] {
+            let server = Server::start(Ipv4Addr::LOCALHOST, reply, Duration::ZERO).await;
+            let mut resolver = resolver(&[&server], Hosts::default());
+            resolver.configuration.get_mut().unwrap().options.timeout = Duration::from_secs(2);
+            let config = SessionConfig::new(target())
+                .with_count(1)
+                .unwrap()
+                .with_family(family)
+                .with_resolve_timeout(Duration::from_millis(200))
+                .unwrap();
+            let session = Engine::new(resolver, Open).collect(&config).await.unwrap();
+            assert_eq!(session.summary().counts().open(), 1);
+            assert!(family.accepts(&session.resolution().unwrap().selected()));
+            assert_eq!(server.requests(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_address_sets_do_not_leak_between_families() {
+        let server = Server::start(Ipv4Addr::LOCALHOST, Reply::DualStack, Duration::ZERO).await;
+        let engine = Engine::new(resolver(&[&server], Hosts::default()), Open);
+        for cached in [false, true] {
+            for family in [AddressFamily::Ipv4, AddressFamily::Ipv6, AddressFamily::Any] {
+                let target = Target::new("answer.test.", if cached { 8443 } else { 443 }).unwrap();
+                let config = SessionConfig::new(target)
+                    .with_count(1)
+                    .unwrap()
+                    .with_family(family);
+                let session = engine.collect(&config).await.unwrap();
+                let resolution = session.resolution().unwrap();
+                assert_eq!(
+                    resolution.source(),
+                    if cached {
+                        ResolutionSource::Cache
+                    } else {
+                        ResolutionSource::Dns(server.config.ip)
+                    }
+                );
+                assert_eq!(
+                    resolution.candidates().len(),
+                    if family == AddressFamily::Any { 2 } else { 1 }
+                );
+                assert!(
+                    resolution
+                        .candidates()
+                        .iter()
+                        .all(|address| family.accepts(address))
+                );
+                assert_eq!(
+                    resolution.selected().port(),
+                    if cached { 8443 } else { 443 }
+                );
+            }
+        }
+        assert_eq!(server.requests(), 4);
+    }
+
+    #[tokio::test]
+    async fn hosts_and_literals_respect_requested_family() {
+        let server = Server::start(Ipv4Addr::LOCALHOST, Reply::DualStack, Duration::ZERO).await;
+        let mut hosts = Hosts::default();
+        hosts
+            .read_hosts_conf(b"192.0.2.9 local.test v4.test\n2001:db8::9 local.test\n".as_slice())
+            .unwrap();
+        let resolver = resolver(&[&server], hosts);
+        for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
+            let local = resolver
+                .resolve(&"local.test:443".parse().unwrap(), family)
+                .await
+                .unwrap();
+            assert_eq!(local.source, ResolutionSource::Hosts);
+            assert_eq!(local.addresses.len(), 1);
+            assert!(family.accepts(&local.addresses[0]));
+        }
+        assert_eq!(server.requests(), 0);
+        let fallback = resolver
+            .resolve(&"v4.test:443".parse().unwrap(), AddressFamily::Ipv6)
+            .await
+            .unwrap();
+        assert_eq!(fallback.source, ResolutionSource::Dns(server.config.ip));
+        assert!(fallback.addresses.iter().all(SocketAddr::is_ipv6));
+        assert_eq!(server.requests(), 1);
+        let literal = resolver
+            .resolve(&"[::1]:443".parse().unwrap(), AddressFamily::Ipv4)
+            .await
+            .unwrap();
+        assert_eq!(literal.source, ResolutionSource::Literal);
+        assert!(literal.addresses.is_empty());
+        assert_eq!(server.requests(), 1);
+    }
+
+    #[tokio::test]
     async fn caches_positive_answers_without_claiming_a_fresh_dns_response() {
         let server = Server::start(Ipv4Addr::LOCALHOST, Reply::Address(30), Duration::ZERO).await;
         let resolver = resolver(&[&server], Hosts::default());
-        let first = resolver.resolve(&target()).await.unwrap();
+        let first = resolver
+            .resolve(&target(), AddressFamily::Any)
+            .await
+            .unwrap();
         assert_eq!(first.source, ResolutionSource::Dns(server.config.ip));
         assert_eq!(first.addresses[0], "192.0.2.42:443".parse().unwrap());
         let queries = server.requests();
         let cached = resolver
-            .resolve(&"answer.test.:8443".parse().unwrap())
+            .resolve(&"answer.test.:8443".parse().unwrap(), AddressFamily::Any)
             .await
             .unwrap();
         assert_eq!(cached.source, ResolutionSource::Cache);
@@ -324,7 +520,11 @@ mod tests {
         let resolver = resolver(&[&server], Hosts::default());
         for _ in 0..2 {
             assert!(matches!(
-                resolver.resolve(&target()).await.unwrap().source,
+                resolver
+                    .resolve(&target(), AddressFamily::Any)
+                    .await
+                    .unwrap()
+                    .source,
                 ResolutionSource::Dns(_)
             ));
         }
@@ -332,10 +532,14 @@ mod tests {
         assert!(resolver.cache.lock().await.is_empty());
         resolver.cache.lock().await.push_back(CachedLookup {
             name: target().host().into_name().unwrap(),
+            family: AddressFamily::Any,
             ips: vec!["192.0.2.99".parse().unwrap()],
             valid_until: Instant::now() - Duration::from_secs(1),
         });
-        let lookup = resolver.resolve(&target()).await.unwrap();
+        let lookup = resolver
+            .resolve(&target(), AddressFamily::Any)
+            .await
+            .unwrap();
         assert_eq!(
             lookup.addresses[0].ip(),
             "192.0.2.42".parse::<IpAddr>().unwrap()
@@ -351,13 +555,13 @@ mod tests {
             .unwrap();
         let resolver = resolver(&[], hosts);
         let lookup = resolver
-            .resolve(&"local.test:443".parse().unwrap())
+            .resolve(&"local.test:443".parse().unwrap(), AddressFamily::Any)
             .await
             .unwrap();
         assert_eq!(lookup.source, ResolutionSource::Hosts);
         assert_eq!(lookup.addresses.len(), 2);
         let lookup = resolver
-            .resolve(&"[::1]:443".parse().unwrap())
+            .resolve(&"[::1]:443".parse().unwrap(), AddressFamily::Any)
             .await
             .unwrap();
         assert_eq!(lookup.source, ResolutionSource::Literal);
@@ -369,7 +573,7 @@ mod tests {
         let server = Server::start(Ipv4Addr::LOCALHOST, Reply::Alias, Duration::ZERO).await;
         let resolver = resolver(&[&server], Hosts::default());
         let lookup = resolver
-            .resolve(&"alias.test.:443".parse().unwrap())
+            .resolve(&"alias.test.:443".parse().unwrap(), AddressFamily::Any)
             .await
             .unwrap();
         assert_eq!(lookup.source, ResolutionSource::Dns(server.config.ip));
@@ -382,9 +586,12 @@ mod tests {
         let server = Server::start(Ipv4Addr::LOCALHOST, Reply::Silent, Duration::ZERO).await;
         let resolver = resolver(&[&server], Hosts::default());
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), resolver.resolve(&target()))
-                .await
-                .is_err()
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                resolver.resolve(&target(), AddressFamily::Any)
+            )
+            .await
+            .is_err()
         );
         assert!(server.requests() > 0);
         assert!(resolver.cache.lock().await.is_empty());
@@ -401,7 +608,10 @@ mod tests {
             .unwrap()
             .options
             .num_concurrent_reqs = 1;
-        let lookup = resolver.resolve(&target()).await.unwrap();
+        let lookup = resolver
+            .resolve(&target(), AddressFamily::Any)
+            .await
+            .unwrap();
         assert_eq!(lookup.addresses[0], "192.0.2.42:443".parse().unwrap());
         assert!(matches!(lookup.source, ResolutionSource::Dns(_)));
         assert!(first.requests() > 0 && second.requests() > 0);
@@ -413,18 +623,22 @@ mod tests {
         let resolver = resolver(&[&server], Hosts::default());
         for index in 0..=CACHE_CAPACITY {
             let target = format!("host{index}.test.:443").parse().unwrap();
-            resolver.resolve(&target).await.unwrap();
+            resolver.resolve(&target, AddressFamily::Any).await.unwrap();
         }
         assert_eq!(resolver.cache.lock().await.len(), CACHE_CAPACITY);
         let recent = format!("host{CACHE_CAPACITY}.test.:443").parse().unwrap();
         assert_eq!(
-            resolver.resolve(&recent).await.unwrap().source,
+            resolver
+                .resolve(&recent, AddressFamily::Any)
+                .await
+                .unwrap()
+                .source,
             ResolutionSource::Cache
         );
         let queries = server.requests();
         assert!(matches!(
             resolver
-                .resolve(&"host0.test.:443".parse().unwrap())
+                .resolve(&"host0.test.:443".parse().unwrap(), AddressFamily::Any)
                 .await
                 .unwrap()
                 .source,
@@ -447,7 +661,10 @@ mod tests {
             let second =
                 Server::start(Ipv4Addr::LOCALHOST, Reply::Address(30), Duration::ZERO).await;
             let resolver = resolver(&[&first, &second], Hosts::default());
-            let lookup = resolver.resolve(&target()).await.unwrap();
+            let lookup = resolver
+                .resolve(&target(), AddressFamily::Any)
+                .await
+                .unwrap();
             assert_eq!(lookup.source, ResolutionSource::Dns(second.config.ip));
             assert_ne!(lookup.source.dns_server(), Some(first.config.ip));
             assert!(second.requests() >= 2);

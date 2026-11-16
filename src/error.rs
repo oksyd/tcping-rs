@@ -4,6 +4,8 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigError {
+    #[error("probe mode must be connect or syn")]
+    ProbeMode,
     #[error("invalid target: {0}")]
     Target(String),
     #[error("{0} must be greater than zero")]
@@ -19,6 +21,12 @@ pub enum ConfigError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SessionError {
+    #[error("cannot prepare {mode} probe: {source}")]
+    ProbeSetup {
+        mode: crate::ProbeMode,
+        #[source]
+        source: io::Error,
+    },
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error("DNS resolution failed: {0}")]

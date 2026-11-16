@@ -1,4 +1,4 @@
-//! TCP connection probes with explicit outcomes, deadlines, and cancellation.
+//! TCP connect and Linux SYN probes with explicit outcomes, deadlines, and cancellation.
 //!
 //! The async engine owns no runtime and performs no terminal I/O. Network
 //! adapters can be replaced for deterministic tests or application integration.
@@ -10,7 +10,7 @@
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = SessionConfig::new("example.com:443".parse()?)
 //!     .with_count(4)?
-//!     .with_connect_timeout(Duration::from_secs(2))?;
+//!     .with_probe_timeout(Duration::from_secs(2))?;
 //! let engine = Engine::default();
 //! let session = engine.collect(&config).await?;
 //! assert_eq!(session.probes().len(), 4);
@@ -43,5 +43,5 @@ pub use model::{
     Counts, Event, Failure, FailureKind, LatencyStats, Outcome, Probe, Resolution,
     ResolutionSource, Session, StopReason, Summary,
 };
-pub use network::{Connector, DnsResolver, Lookup, Resolver, TcpConnector};
+pub use network::{DnsResolver, Lookup, ProbeBackend, ProbeMode, ProbeSession, Resolver};
 pub use target::Target;

@@ -8,7 +8,7 @@ use std::{
     io::{self, IsTerminal},
     ops::ControlFlow,
 };
-use tcping::{ConfigError, Engine, RunError, SessionError, StopReason, Summary};
+use tcping::{ConfigError, DnsResolver, Engine, RunError, SessionError, StopReason, Summary};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -38,9 +38,9 @@ pub(crate) fn run(args: Args) -> Result<u8, AppError> {
         },
     );
     let mut renderer = Renderer::new(writer, args.output_mode, args.timestamp_format(), color);
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         let cancel = signals::install()?;
-        let result = Engine::default()
+        let result = Engine::new(DnsResolver::default(), args.mode)
             .run_until(&config, cancel, |event| {
                 renderer.write_event(event)?;
                 Ok::<_, io::Error>(ControlFlow::Continue(()))
@@ -51,7 +51,10 @@ pub(crate) fn run(args: Args) -> Result<u8, AppError> {
             Err(RunError::Session(error)) => Err(error.into()),
             Err(RunError::Handler(error)) => Err(error.into()),
         }
-    })
+    });
+    // Cancelled system reads must not delay process exit during runtime shutdown.
+    runtime.shutdown_background();
+    result
 }
 
 fn exit_code(summary: &Summary) -> u8 {
