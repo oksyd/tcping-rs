@@ -79,7 +79,7 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
       - name: Cache Cargo registry
         if: steps.changes.outputs.check == 'true'
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -90,7 +90,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-${{ steps.package.outputs.toolchain }}-
       - name: Cache compiled checks
         if: steps.changes.outputs.check == 'true'
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/debug/
           key: checks-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.package.outputs.toolchain }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
