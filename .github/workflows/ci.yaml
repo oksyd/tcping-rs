@@ -4,10 +4,8 @@ on:
   push:
     branches: [ main ]
     paths-ignore:
-      - 'Dockerfile'
       - 'CHANGELOG.md'
       - 'README.md'
-      - 'README.zh-CN.md'
   pull_request:
     branches: [ main ]
 
@@ -19,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_TOOLCHAIN: 1.95.0
+  RUST_TOOLCHAIN: 1.100.0
 
 jobs:
   lint:
@@ -48,8 +46,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --locked
+
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test-${{ matrix.os }}
@@ -81,4 +84,19 @@ jobs:
             ${{ runner.os }}-cargo-registry-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Run tests
-        run: cargo test --verbose --locked
+        run: cargo test --locked
+
+      - name: Test library without CLI dependencies
+        run: cargo test --no-default-features --locked
+
+      - name: Test report feature independently
+        run: cargo test --no-default-features --features report --locked
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build container
+        run: docker build --tag tcping:ci .
+      - name: Smoke test
+        run: docker run --rm tcping:ci --version

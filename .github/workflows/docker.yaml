@@ -15,8 +15,7 @@ permissions:
 
 env:
   CONTEXT: .
-  GHCR_TAG: ghcr.io/lvillis/tcping:latest
-  DOCKER_TAG: docker.io/lvillis/tcping:latest
+  GHCR_TAG: ghcr.io/oksyd/tcping:latest
   BUILDER_NAME: tcping-builder
 
 jobs:
@@ -35,12 +34,6 @@ jobs:
           docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
           docker buildx inspect --bootstrap
 
-      - name: Login to docker.io
-        env:
-          DOCKER_USER: ${{ secrets.DOCKER_USER }}
-          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
-        run: echo "${DOCKER_TOKEN}" | docker login docker.io --username "${DOCKER_USER}" --password-stdin
-
       - name: Login to ghcr.io
         env:
           GHCR_USER: ${{ github.repository_owner }}
@@ -54,8 +47,7 @@ jobs:
             --platform linux/amd64,linux/arm64 \
             --file Dockerfile \
             --push \
-            --cache-from "type=registry,ref=${DOCKER_TAG}" \
+            --cache-from "type=registry,ref=${GHCR_TAG}" \
             --cache-to type=inline \
             --tag "${GHCR_TAG}" \
-            --tag "${DOCKER_TAG}" \
             "${CONTEXT}"

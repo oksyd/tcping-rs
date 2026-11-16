@@ -1,80 +1,23 @@
-//! Binary entry point for **tcping-rs**.
-//!
-//! * Parses CLI arguments.
-//! * Runs the CLI adapter on top of the library probing API.
-//! * On **Windows**:
-//!   - Requests a 1 ms system timer (`timeBeginPeriod`).
-//!   - Raises current thread priority to `THREAD_PRIORITY_HIGHEST`.
-#![deny(unreachable_pub)]
-
 mod app;
 mod cli;
-mod formatter;
+mod output;
+mod signals;
 
-use crate::cli::Args;
 use clap::Parser;
-use std::process::ExitCode;
-use tcping::Result;
+use std::{
+    io::{self, Write},
+    process::ExitCode,
+};
 
-#[cfg(windows)]
-mod win_boost {
-    //! Lightweight FFI wrappers for high-resolution timing & priority.
-
-    #[link(name = "winmm")]
-    unsafe extern "system" {
-        fn timeBeginPeriod(period: u32) -> u32;
-        fn timeEndPeriod(period: u32) -> u32;
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
-        fn GetCurrentThread() -> *mut core::ffi::c_void;
-    }
-
-    pub(crate) struct HighResTimerGuard {
-        period: Option<u32>,
-    }
-
-    impl HighResTimerGuard {
-        pub(crate) fn enable(period: u32) -> Self {
-            let ok = unsafe { timeBeginPeriod(period) } == 0;
-            Self {
-                period: ok.then_some(period),
-            }
+fn main() -> ExitCode {
+    match app::run(cli::Args::parse()) {
+        Ok(code) => ExitCode::from(code),
+        Err(app::AppError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "error: {error}");
+            ExitCode::from(2)
         }
     }
-
-    impl Drop for HighResTimerGuard {
-        fn drop(&mut self) {
-            if let Some(period) = self.period {
-                unsafe { timeEndPeriod(period) };
-            }
-        }
-    }
-
-    pub(crate) fn elevate_thread_priority() {
-        const THREAD_PRIORITY_HIGHEST: i32 = 2;
-        // SAFETY: current thread handle is always valid.
-        unsafe {
-            let th = GetCurrentThread();
-            SetThreadPriority(th, THREAD_PRIORITY_HIGHEST);
-        }
-    }
-}
-
-fn main() -> Result<ExitCode> {
-    #[cfg(windows)]
-    let _timer_guard = win_boost::HighResTimerGuard::enable(1);
-
-    #[cfg(windows)]
-    win_boost::elevate_thread_priority();
-
-    let args = Args::parse();
-    let exit_code = app::run(args)?;
-    Ok(if exit_code == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
 }
