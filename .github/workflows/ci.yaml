@@ -107,9 +107,9 @@ jobs:
       - name: Test supported features
         if: steps.changes.outputs.check == 'true'
         run: |
-          cargo test --locked
-          cargo test --no-default-features --locked
-          cargo test --no-default-features --features report --locked
+          cargo test --locked --no-fail-fast
+          cargo test --no-default-features --locked --no-fail-fast
+          cargo test --no-default-features --features report --locked --no-fail-fast
       - name: Test Linux SYN packets on loopback
         if: steps.changes.outputs.check == 'true'
         run: |

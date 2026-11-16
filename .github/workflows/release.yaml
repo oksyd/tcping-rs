@@ -108,7 +108,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Test Windows and macOS
         if: ${{ matrix.target == 'x86_64-pc-windows-msvc' || runner.os == 'macOS' }}
-        run: cargo test --release --locked --target "$TARGET"
+        run: cargo test --release --locked --no-fail-fast --target "$TARGET"
       - name: Build
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc

@@ -175,21 +175,25 @@ fn explicit_colors_apply_only_to_normal_output() {
 
 #[test]
 fn refused_connections_are_explicit_failures_without_rtt() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    drop(listener);
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = reserved.local_addr().unwrap().to_string();
     for mode in ["normal", "md", "json", "csv"] {
-        let output = run(&address, &["-o", mode]);
+        // Windows may retry SYN packets before reporting connection refused.
+        let output = run(&address, &["-o", mode, "--timeout-ms", "10000"]);
         assert_eq!(output.status.code(), Some(1), "{mode}: {output:?}");
+        assert!(output.stderr.is_empty(), "{mode}: {output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
         if mode == "json" {
             let records = text
                 .lines()
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(records[1]["status"], "refused");
-            assert!(records[1]["rtt_ms"].is_null());
+            assert_eq!(records[1]["status"], "refused", "{text}");
+            assert!(records[1]["rtt_ms"].is_null(), "{text}");
             assert!(records[1]["elapsed_ms"].is_number());
+            assert_eq!(records[2]["counts"]["failed"], 1, "{text}");
+            assert_eq!(records[2]["counts"]["timed_out"], 0, "{text}");
             assert!(records.iter().all(|r| r.get("timestamp").is_none()));
         } else if mode == "csv" {
             let lines = text.lines().collect::<Vec<_>>();
@@ -197,15 +201,20 @@ fn refused_connections_are_explicit_failures_without_rtt() {
             let row = lines[2].split(',').collect::<Vec<_>>();
             assert_eq!(
                 row[columns.iter().position(|v| *v == "status").unwrap()],
-                "refused"
+                "refused",
+                "{text}"
             );
             assert_eq!(
                 row[columns.iter().position(|v| *v == "rtt_ms").unwrap()],
-                ""
+                "",
+                "{text}"
             );
         } else {
-            assert!(text.contains("FAILED: connection refused (port closed)"));
-            assert!(!text.contains("Round-trip"));
+            assert!(
+                text.contains("FAILED: connection refused (port closed)"),
+                "{mode}: {text}"
+            );
+            assert!(!text.contains("Round-trip"), "{mode}: {text}");
         }
     }
 }

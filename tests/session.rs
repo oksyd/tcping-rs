@@ -285,6 +285,43 @@ async fn deadline_wins_over_simultaneous_connection_success() {
     assert_eq!(session.probes()[0].outcome(), &Outcome::TimedOut);
 }
 #[tokio::test(start_paused = true)]
+async fn delayed_refusal_obeys_the_configured_deadline() {
+    for (delay_ms, timeout_ms, expected) in [
+        (1999, 2000, "refused"),
+        (2000, 2000, "timeout"),
+        (2500, 2000, "timeout"),
+        (2500, 10000, "refused"),
+    ] {
+        let config = SessionConfig::new(ADDRESS.parse().unwrap())
+            .with_count(1)
+            .unwrap()
+            .with_probe_timeout(Duration::from_millis(timeout_ms))
+            .unwrap();
+        let backend = FakeBackend::new([Step::refused(delay_ms)]);
+        let activity = backend.activity.clone();
+        let session = Engine::new(FakeResolver::default(), backend)
+            .collect(&config)
+            .await
+            .unwrap();
+        let probe = &session.probes()[0];
+        assert_eq!(probe.outcome().code(), expected, "{session:?}");
+        assert_eq!(probe.rtt(), None);
+        assert_eq!(
+            probe.elapsed(),
+            Duration::from_millis(delay_ms.min(timeout_ms))
+        );
+        assert_eq!(
+            session.summary().counts().failed(),
+            u64::from(expected == "refused")
+        );
+        assert_eq!(
+            session.summary().counts().timed_out(),
+            u64::from(expected == "timeout")
+        );
+        assert_eq!((activity.calls(), activity.dropped()), (1, 1));
+    }
+}
+#[tokio::test(start_paused = true)]
 async fn cancellation_wins_over_simultaneous_deadline() {
     let engine = Engine::new(FakeResolver::default(), FakeBackend::new([Step::stalled()]));
     let session = engine
@@ -456,19 +493,25 @@ async fn continuous_sessions_require_streaming() {
 }
 #[tokio::test]
 async fn real_tcp_connection_and_refusal() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = reserved.local_addr().unwrap();
     let config = SessionConfig::new(address.to_string().parse().unwrap())
         .with_count(1)
+        .unwrap()
+        // Windows may retry SYN packets before reporting connection refused.
+        .with_probe_timeout(Duration::from_secs(10))
         .unwrap();
     let engine = Engine::default();
     let session = engine.collect(&config).await.unwrap();
-    assert!(session.probes()[0].outcome().is_open());
-    drop(listener);
-    let session = engine.collect(&config).await.unwrap();
     assert!(
-        matches!(session.probes()[0].outcome(), Outcome::Failed(f) if f.kind() == FailureKind::Refused)
+        matches!(session.probes()[0].outcome(), Outcome::Failed(f) if f.kind() == FailureKind::Refused),
+        "{session:?}"
     );
+    assert_eq!(session.probes()[0].rtt(), None);
+    let _listener = reserved.listen(1).unwrap();
+    let session = engine.collect(&config).await.unwrap();
+    assert!(session.probes()[0].outcome().is_open(), "{session:?}");
 }
 #[cfg(feature = "report")]
 #[tokio::test(start_paused = true)]
