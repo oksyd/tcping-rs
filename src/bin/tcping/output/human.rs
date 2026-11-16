@@ -306,11 +306,11 @@ mod tests {
                 "1970-01-01T00:00:00.100Z",
             ),
             (
-                UNIX_EPOCH + Duration::from_nanos(123_456_789),
+                UNIX_EPOCH + Duration::from_nanos(123_456_700),
                 "1970-01-01T00:00:00.123Z",
             ),
             (
-                UNIX_EPOCH + Duration::from_nanos(999_999_999),
+                UNIX_EPOCH + Duration::from_nanos(999_999_900),
                 "1970-01-01T00:00:00.999Z",
             ),
             (
@@ -318,17 +318,17 @@ mod tests {
                 "1970-01-02T00:00:00.000Z",
             ),
             (
-                UNIX_EPOCH - Duration::from_nanos(1),
+                UNIX_EPOCH - Duration::from_nanos(100),
                 "1969-12-31T23:59:59.999Z",
             ),
         ] {
             assert_eq!(timestamp(at, TimestampFormat::Iso8601).unwrap(), expected);
         }
         assert_eq!(
-            Timestamp::from_system_time(UNIX_EPOCH + Duration::from_nanos(123_456_789))
+            Timestamp::from_system_time(UNIX_EPOCH + Duration::from_nanos(123_456_700))
                 .unwrap()
                 .utc,
-            "1970-01-01T00:00:00.123456789Z"
+            "1970-01-01T00:00:00.1234567Z"
         );
     }
 
