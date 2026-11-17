@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -492,26 +494,32 @@ async fn continuous_sessions_require_streaming() {
     assert_eq!(summary.reason(), StopReason::Cancelled);
 }
 #[tokio::test]
-async fn real_tcp_connection_and_refusal() {
-    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
-    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let address = reserved.local_addr().unwrap();
+async fn real_tcp_connection_is_open() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = SessionConfig::new(address.to_string().parse().unwrap())
+        .with_count(1)
+        .unwrap();
+    let session = Engine::default().collect(&config).await.unwrap();
+    assert!(session.probes()[0].outcome().is_open(), "{session:?}");
+    assert!(session.probes()[0].rtt().is_some());
+}
+
+#[tokio::test]
+async fn real_tcp_connection_is_refused() {
+    let endpoint = common::RefusedEndpoint::new().await;
+    let address = endpoint.address();
     let config = SessionConfig::new(address.to_string().parse().unwrap())
         .with_count(1)
         .unwrap()
-        // Windows may retry SYN packets before reporting connection refused.
-        .with_probe_timeout(Duration::from_secs(10))
+        .with_probe_timeout(common::REFUSAL_TIMEOUT)
         .unwrap();
-    let engine = Engine::default();
-    let session = engine.collect(&config).await.unwrap();
+    let session = Engine::default().collect(&config).await.unwrap();
     assert!(
         matches!(session.probes()[0].outcome(), Outcome::Failed(f) if f.kind() == FailureKind::Refused),
         "{session:?}"
     );
     assert_eq!(session.probes()[0].rtt(), None);
-    let _listener = reserved.listen(1).unwrap();
-    let session = engine.collect(&config).await.unwrap();
-    assert!(session.probes()[0].outcome().is_open(), "{session:?}");
 }
 #[cfg(feature = "report")]
 #[tokio::test(start_paused = true)]

@@ -1,4 +1,6 @@
 #![cfg(feature = "cli")]
+mod common;
+
 #[cfg(unix)]
 use std::io::Read;
 use std::{
@@ -173,14 +175,13 @@ fn explicit_colors_apply_only_to_normal_output() {
     }
 }
 
-#[test]
-fn refused_connections_are_explicit_failures_without_rtt() {
-    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
-    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let address = reserved.local_addr().unwrap().to_string();
+#[tokio::test]
+async fn refused_connections_are_explicit_failures_without_rtt() {
+    let endpoint = common::RefusedEndpoint::new().await;
+    let address = endpoint.address().to_string();
+    let timeout = common::REFUSAL_TIMEOUT.as_millis().to_string();
     for mode in ["normal", "md", "json", "csv"] {
-        // Windows may retry SYN packets before reporting connection refused.
-        let output = run(&address, &["-o", mode, "--timeout-ms", "10000"]);
+        let output = run(&address, &["-o", mode, "--timeout-ms", &timeout]);
         assert_eq!(output.status.code(), Some(1), "{mode}: {output:?}");
         assert!(output.stderr.is_empty(), "{mode}: {output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
